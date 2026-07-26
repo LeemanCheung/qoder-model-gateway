@@ -1,0 +1,29 @@
+# Build outputs and downloaded executables
+/qodercli2api
+/qodercli2api-*
+/qodercli-*
+/claude2api-*
+*.log
+
+# Local credentials, settings, dumps, and state
+/qodercli2api.env
+/.qoder/
+/.qodercli2api/
+/.claude/
+/dumps/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# Reverse-engineering workspace is local-only
+/re/
+
+# Only the two reviewed public documents are tracked
+/docs/*
+!/docs/oauth.md
+!/docs/inference-protocol.md
+
+# Python/local tool state
+__pycache__/
+*.pyc
+/.venv/

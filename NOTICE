@@ -1,0 +1,21 @@
+qodercli2api
+Copyright (C) 2026 Liki4
+
+This project is an independent interoperability project and is not affiliated
+with, endorsed by, or sponsored by Qoder or Alibaba.
+
+Except for the third-party component identified below, this repository is
+licensed under the GNU Affero General Public License version 3.0 as provided
+in LICENSE.
+
+Third-party component:
+  assets/qoder_auth_wasm_bg.wasm
+
+That WebAssembly module originates from Qoder CLI. It is not licensed under
+this project's AGPL-3.0 license. Qoder, Alibaba, and related names and marks
+belong to their respective owners. Redistribution permission for that module
+must be confirmed by the repository maintainer and applicable rightsholders.
+
+This repository does not distribute Qoder CLI, user credentials, captured
+traffic, model catalogs, or local account data. Users must use their own
+authorized subscription and comply with applicable service terms and law.
