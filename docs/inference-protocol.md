@@ -151,6 +151,7 @@ delta 字段：
 | qmodel | Qwen3.7-Plus | - | ✓ | 1M |
 | kmodel_latest | Kimi-K3 | - | ✓ | 1M |
 | kmodel | Kimi-K2.7-Code | - | ✓ | 256k |
+| gmodel | GLM-5.3 | ✓ | ✓ | 1M |
 | gm51model | GLM-5.2 | ✓ | ✓ | 1M |
 | dmodel | DeepSeek-V4-Pro | ✓ | ✓ | 1M |
 | dfmodel | DeepSeek-V4-Flash | ✓ | ✓ | 1M |

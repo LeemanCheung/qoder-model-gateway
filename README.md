@@ -170,8 +170,10 @@ curl -N -X POST http://127.0.0.1:8377/v1/responses \
 | `POST /v1/messages/count_tokens` | 粗估 token（Claude Code 压缩上下文用） |
 | `POST /v1/chat/completions` | OpenAI Chat（SSE/非流式/工具调用/`reasoning_effort`） |
 | `POST /v1/responses` | OpenAI Responses（SSE/非流式，Codex 适用） |
-| `GET /v1/models` | 模型列表 |
+| `GET /v1/models` | 模型列表；`id` 为友好模型名，`qoder_key` 为内部 Qoder key。 |
 | `GET /health` | 健康检查 |
+
+`/v1/models` 返回的友好 `id`（例如 `Qwen3.8-Max`）可直接用于三个推理 API；旧内部 key（如 `qmodel_38max`）继续兼容。显示名为空、重名、与内部 key 冲突或以保留后缀 `[1m]` 结尾时，`id` 安全回退为内部 key。`name`/`display_name` 用于展示，`qoder_key` 保留内部键。
 
 ### 3.3 systemd 部署
 
@@ -196,12 +198,13 @@ curl -N -X POST http://127.0.0.1:8377/v1/responses \
 | `qmodel` | Qwen3.7-Plus | - | ✓ | **1M** |
 | `kmodel_latest` | Kimi-K3 | - | ✓ | **1M** |
 | `kmodel` | Kimi-K2.7-Code | - | ✓ | 256k |
+| `gmodel` | GLM-5.3 | ✓ | ✓ | **1M** |
 | `gm51model` | GLM-5.2 | ✓ | ✓ | **1M** |
 | `dmodel` | DeepSeek-V4-Pro | ✓ | ✓ | **1M** |
 | `dfmodel` | DeepSeek-V4-Flash | ✓ | ✓ | **1M** |
 | `mmodel` | MiniMax-M3 | - | ✓ | **1M** |
 
-模型选择优先级：`-model-map` 精确匹配 > 客户端 model 即 qoder key > `[1m]` 后缀处理 > `-default-model` 兜底。
+模型选择流程：先识别并移除 `[1m]` 后缀；基础模型按 `-model-map` 精确匹配 > `-model-map["*"]` > 内部 Qoder key 或唯一友好名称 > `-default-model` 兜底选择。若请求带 `[1m]` 且基础模型不足 1M，再尝试升级到 `-model-1m` 指定的 1M 模型。
 
 ### 4.2 effort / thinking
 
