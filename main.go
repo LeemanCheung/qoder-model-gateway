@@ -267,14 +267,14 @@ func patLogin(ctx context.Context, am *authManager, pat string) error {
 		return fmt.Errorf("jobToken/exchange status %d: %s", resp.StatusCode, truncate(string(raw), 200))
 	}
 	var r struct {
-		Token         string `json:"token"`
-		DeviceToken   string `json:"device_token"`
-		AccessToken   string `json:"access_token"`
-		RefreshToken  string `json:"refresh_token"`
-		ExpiresAt     string `json:"expires_at"`
-		ExpiresIn     int64  `json:"expires_in"`
-		RefreshExpAt  string `json:"refresh_token_expires_at"`
-		RefreshExpIn  int64  `json:"refresh_token_expires_in"`
+		Token        string `json:"token"`
+		DeviceToken  string `json:"device_token"`
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+		ExpiresAt    string `json:"expires_at"`
+		ExpiresIn    int64  `json:"expires_in"`
+		RefreshExpAt string `json:"refresh_token_expires_at"`
+		RefreshExpIn int64  `json:"refresh_token_expires_in"`
 	}
 	if err := json.Unmarshal(raw, &r); err != nil {
 		return err
@@ -294,8 +294,8 @@ func patLogin(ctx context.Context, am *authManager, pat string) error {
 		SecurityOAuthToken: tok, AccessToken: tok,
 		RefreshToken: r.RefreshToken, ExpireTime: parseExpiry(r.ExpiresAt, r.ExpiresIn),
 		RefreshTokenExpireTime: parseExpiry(r.RefreshExpAt, r.RefreshExpIn),
-		PersonalAccessToken: pat,
-		LoginMethod: "token", LoginTimestamp: time.Now().Unix(),
+		PersonalAccessToken:    pat,
+		LoginMethod:            "token", LoginTimestamp: time.Now().Unix(),
 	}
 	am.mu.Unlock()
 	am.fetchUserInfo(ctx)
