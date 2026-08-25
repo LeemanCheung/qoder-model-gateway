@@ -78,15 +78,38 @@ func (s *server) dumpFailure(requestID, errMsg string) {
 
 type modelResolver struct {
 	byKey   map[string]*modelConfig
+	byName  map[string]*modelConfig
 	mapping map[string]string
 	def     string
 	oneM    string
 }
 
 func newModelResolver(catalog []*modelConfig, mapping map[string]string, def string, oneM string) *modelResolver {
-	r := &modelResolver{byKey: map[string]*modelConfig{}, mapping: mapping, def: def, oneM: oneM}
+	r := &modelResolver{
+		byKey:   map[string]*modelConfig{},
+		byName:  map[string]*modelConfig{},
+		mapping: mapping,
+		def:     def,
+		oneM:    oneM,
+	}
 	for _, mc := range catalog {
 		r.byKey[mc.Key] = mc
+	}
+	nameCounts := map[string]int{}
+	for _, mc := range r.byKey {
+		if name := strings.TrimSpace(mc.DisplayName); name != "" {
+			nameCounts[name]++
+		}
+	}
+	for _, mc := range r.byKey {
+		name := strings.TrimSpace(mc.DisplayName)
+		if name == "" || nameCounts[name] != 1 {
+			continue
+		}
+		if keyed, ok := r.byKey[name]; ok && keyed.Key != mc.Key {
+			continue
+		}
+		r.byName[name] = mc
 	}
 	if r.def == "" {
 		r.def = "auto"
@@ -95,6 +118,25 @@ func newModelResolver(catalog []*modelConfig, mapping map[string]string, def str
 		r.oneM = "ultimate"
 	}
 	return r
+}
+
+func (r *modelResolver) modelByIdentifier(identifier string) (*modelConfig, bool) {
+	if mc, ok := r.byKey[identifier]; ok {
+		return mc, true
+	}
+	mc, ok := r.byName[identifier]
+	return mc, ok
+}
+
+func (r *modelResolver) publicID(mc *modelConfig) string {
+	if mc == nil {
+		return ""
+	}
+	name := strings.TrimSpace(mc.DisplayName)
+	if named, ok := r.byName[name]; ok && named.Key == mc.Key {
+		return name
+	}
+	return mc.Key
 }
 
 // resolve maps a client model name to a qoder model_config.
@@ -115,8 +157,8 @@ func (r *modelResolver) resolve(clientModel string) *modelConfig {
 		}
 	}
 	if key == "" {
-		if _, ok := r.byKey[name]; ok {
-			key = name
+		if mc, ok := r.modelByIdentifier(name); ok {
+			key = mc.Key
 		} else {
 			key = r.def
 		}
@@ -131,7 +173,7 @@ func (r *modelResolver) resolve(clientModel string) *modelConfig {
 }
 
 func (r *modelResolver) byKeyOrSynthetic(key string) *modelConfig {
-	if mc, ok := r.byKey[key]; ok {
+	if mc, ok := r.modelByIdentifier(key); ok {
 		cp := *mc
 		return &cp
 	}
