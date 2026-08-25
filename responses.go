@@ -50,6 +50,44 @@ type respContentPart struct {
 	ImageURL string `json:"image_url,omitempty"`
 }
 
+func isCompactRespMessage(it respInputItem) bool {
+	switch it.Role {
+	case "user", "assistant", "system", "developer":
+	default:
+		return false
+	}
+	if raw := strings.TrimSpace(string(it.Content)); raw == "" || raw == "null" {
+		return false
+	}
+	var text string
+	if err := json.Unmarshal(it.Content, &text); err == nil {
+		return true
+	}
+	var parts []struct {
+		Type     string  `json:"type"`
+		Text     *string `json:"text"`
+		ImageURL *string `json:"image_url"`
+	}
+	if err := json.Unmarshal(it.Content, &parts); err != nil || len(parts) == 0 {
+		return false
+	}
+	for _, part := range parts {
+		switch part.Type {
+		case "input_text", "output_text", "text":
+			if part.Text == nil {
+				return false
+			}
+		case "input_image":
+			if part.ImageURL == nil || strings.TrimSpace(*part.ImageURL) == "" {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // respToUpstream converts Responses input to (system, []upMessage).
 func respToUpstream(instructions string, input json.RawMessage) (string, []upMessage, error) {
 	sysParts := []string{}
@@ -80,17 +118,15 @@ func respToUpstream(instructions string, input json.RawMessage) (string, []upMes
 	}
 	for _, it := range items {
 		switch it.Type {
-		case "message", "":
-			// Hermes (and some other Responses clients) send input items in the
-			// compact chat form {"role": "user", "content": "..."} with no
-			// `type` field. Treat a missing/empty type as a message so the user
-			// text is not silently dropped. See: ds4f "model can't see user"
-			// reports through Hermes -> sub2api -> qodercli2api.
-			if it.Type == "" && it.Role == "" && it.Content == nil && it.CallID == "" && it.Output == "" {
-				// not a recognizable message item; keep old default behavior
+		case "":
+			// Some Responses clients omit the optional message discriminator.
+			// Only accept the documented compact role/content form.
+			if !isCompactRespMessage(it) {
 				flushAssistant()
 				continue
 			}
+			fallthrough
+		case "message":
 			flushAssistant()
 			if it.Role == "system" || it.Role == "developer" {
 				sysParts = append(sysParts, respPartsText(it.Content))
