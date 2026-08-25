@@ -11,7 +11,7 @@
 | `POST /v1/chat/completions` | OpenAI Chat（SSE/非流式） | 任意 OpenAI 客户端 |
 | `POST /v1/responses` | OpenAI Responses（SSE/非流式） | Codex CLI |
 
-特性：sk 鉴权 · 15 个上游模型可切换（含 1M 上下文）· thinking/effort 映射 ·
+特性：sk 鉴权 · 16 个上游模型可切换（含 1M 上下文）· thinking/effort 映射 ·
 工具调用双向转换 · token 自动刷新 · 内嵌设备流登录。
 
 > 非官方项目，与 Qoder 或 Alibaba 无隶属、背书或赞助关系。仅使用你自己的合法订阅，并遵守适用的服务条款和法律。第三方 WASM 的许可说明见 [NOTICE](NOTICE)。
