@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -133,6 +134,9 @@ func (r *modelResolver) publicID(mc *modelConfig) string {
 		return ""
 	}
 	name := strings.TrimSpace(mc.DisplayName)
+	if strings.HasSuffix(name, "[1m]") {
+		return mc.Key
+	}
 	if named, ok := r.byName[name]; ok && named.Key == mc.Key {
 		return name
 	}
@@ -874,14 +878,36 @@ func (s *server) handleModels(w http.ResponseWriter, r *http.Request) {
 		writeAnthropicError(w, http.StatusUnauthorized, "authentication_error", "invalid or missing api key")
 		return
 	}
-	var list []map[string]any
+	type modelListItem struct {
+		ID          string `json:"id"`
+		Name        string `json:"name"`
+		DisplayName string `json:"display_name"`
+		QoderKey    string `json:"qoder_key"`
+		Object      string `json:"object"`
+		Created     int    `json:"created"`
+		OwnedBy     string `json:"owned_by"`
+		Type        string `json:"type"`
+		MaxTokens   int    `json:"max_tokens"`
+	}
+	list := make([]modelListItem, 0, len(s.models.byKey))
 	for _, mc := range s.models.byKey {
-		list = append(list, map[string]any{
-			"id": mc.Key, "object": "model", "created": 0, "owned_by": "qoder",
-			"type": "model", "display_name": mc.DisplayName,
-			"max_tokens": mc.MaxInputTokens,
+		name := strings.TrimSpace(mc.DisplayName)
+		if name == "" {
+			name = mc.Key
+		}
+		list = append(list, modelListItem{
+			ID:          s.models.publicID(mc),
+			Name:        name,
+			DisplayName: name,
+			QoderKey:    mc.Key,
+			Object:      "model",
+			Created:     0,
+			OwnedBy:     "qoder",
+			Type:        "model",
+			MaxTokens:   mc.MaxInputTokens,
 		})
 	}
+	sort.Slice(list, func(i, j int) bool { return list[i].ID < list[j].ID })
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": list})
 }
