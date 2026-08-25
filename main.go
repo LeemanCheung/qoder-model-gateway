@@ -230,6 +230,7 @@ func builtinCatalog() []*modelConfig {
 		{"qmodel", "Qwen3.7-Plus", false, 1000000},
 		{"kmodel_latest", "Kimi-K3", false, 1000000},
 		{"kmodel", "Kimi-K2.7-Code", false, 256000},
+		{"gmodel", "GLM-5.3", true, 1000000},
 		{"gm51model", "GLM-5.2", true, 1000000},
 		{"dmodel", "DeepSeek-V4-Pro", true, 1000000},
 		{"dfmodel", "DeepSeek-V4-Flash", true, 1000000},
