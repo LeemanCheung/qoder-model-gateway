@@ -29,6 +29,13 @@ func (e *protocolError) Error() string {
 	return e.public
 }
 
+func (e *protocolError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.internal
+}
+
 func newProtocolError(kind protocolErrorKind, public string, internal error) error {
 	return &protocolError{kind: kind, public: public, internal: internal}
 }
@@ -45,6 +52,17 @@ func protocolInternalError(err error) error {
 		return target.internal
 	}
 	return err
+}
+
+func protocolDiagnosticError(err error) error {
+	if err == nil {
+		return nil
+	}
+	internal := protocolInternalError(err)
+	if internal == nil || internal == err {
+		return err
+	}
+	return fmt.Errorf("%s: %w", err.Error(), internal)
 }
 
 func protocolErrorFrom(err error) *protocolError {

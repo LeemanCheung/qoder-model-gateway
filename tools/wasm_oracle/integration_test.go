@@ -29,7 +29,7 @@ func TestAuthorizedWASMFixtureIntegration(t *testing.T) {
 	if status != 0 {
 		t.Fatalf("status=%d safe-output=%q", status, output.String())
 	}
-	wantOperations := []string{`"operation":"credential"`, `"operation":"runtime"`, `"operation":"model-cache"`, `"operation":"infer"`}
+	wantOperations := []string{`"operation":"credential"`, `"operation":"runtime"`, `"operation":"model-cache"`, `"operation":"infer"`, `"operation":"infer-no-org"`}
 	cursor := 0
 	for _, operation := range wantOperations {
 		index := strings.Index(output.String()[cursor:], operation)
@@ -87,6 +87,12 @@ func TestAuthorizedRecomputedManifestNestedTamperingRejected(t *testing.T) {
 			_ = json.Unmarshal(f.Input, &input)
 			input["user"].(map[string]any)["access_token"] = "synthetic-token-substitution"
 			f.Input, _ = json.Marshal(input)
+		}},
+		{name: "no-org caller key substitution", document: "infer-user-no-org.json", category: "fixture-synthetic-schema", mutate: func(f *fixtureDocument) {
+			var expected inferFixtureExpectedPolicy
+			_ = json.Unmarshal(f.Expected, &expected)
+			expected.Header["Cosy-Key"] = []string{"synthetic-substituted-key"}
+			f.Expected, _ = json.Marshal(expected)
 		}},
 		{name: "arbitrary expected", document: "model-cache.json", category: "fixture-synthetic-schema", mutate: func(f *fixtureDocument) {
 			var expected map[string]any
@@ -163,7 +169,7 @@ func TestAuthorizedWASMFreeAccounting(t *testing.T) {
 	if err != nil {
 		t.Fatal(categoryOf(err))
 	}
-	if accounting != (freeAccounting{ResultStrings: 7, Contexts: 1, RequestResults: 1}) {
+	if accounting != (freeAccounting{ResultStrings: 9, Contexts: 2, RequestResults: 2}) {
 		t.Fatalf("free accounting = %#v", accounting)
 	}
 }

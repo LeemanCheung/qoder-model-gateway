@@ -64,6 +64,8 @@ func (f *nativeContextFactory) New(ctx context.Context, config protocolContextCo
 	}
 	operationHost := protocolHostDepsFor(ctx, f.host)
 	operationCtx := withProtocolHostDeps(ctx, operationHost)
+	// Pinned 1.1.34 consumes runtime-generation entropy during New but keeps the
+	// caller's runtime fields as signing state; only the side effects and errors apply.
 	_, err := generator.Generate(operationCtx, runtimeFieldInput{
 		UID:              cloned.User.UID,
 		OrganizationID:   cloned.User.OrganizationID,

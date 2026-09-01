@@ -57,6 +57,30 @@ func (r *modelResolver) keys() []string {
 	return out
 }
 
+func catalogReadErrorDetail(err error) string {
+	var pathErr *os.PathError
+	if errors.As(err, &pathErr) && pathErr != nil {
+		return fmt.Sprintf("%s: %v", pathErr.Op, pathErr.Err)
+	}
+	return fmt.Sprintf("%T", err)
+}
+
+func catalogDecryptErrorDetail(err error) string {
+	if err == nil {
+		return "unknown"
+	}
+	if errors.Is(err, context.Canceled) {
+		return context.Canceled.Error()
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return context.DeadlineExceeded.Error()
+	}
+	if protocolErr := protocolErrorFrom(err); protocolErr != nil {
+		return fmt.Sprintf("kind=%s: %v", protocolErr.kind, protocolInternalError(err))
+	}
+	return fmt.Sprintf("%T", err)
+}
+
 // loadCatalog builds the model catalog: built-in defaults, optionally overridden
 // by a plaintext catalog file or the CLI's encrypted model cache.
 func loadCatalog(ctx context.Context, decryptor modelCacheDecryptor, authFile, uid, catalogPath string, logf func(string, ...any)) []*modelConfig {
@@ -75,13 +99,15 @@ func loadCatalog(ctx context.Context, decryptor modelCacheDecryptor, authFile, u
 		cachePath := filepath.Clean(filepath.Join(filepath.Dir(authFile), "..", ".models", uid, "catalog-v6"))
 		blob, err := os.ReadFile(cachePath)
 		if err != nil {
-			logf("catalog cache read failed")
+			if !errors.Is(err, os.ErrNotExist) {
+				logf("catalog cache read failed: %s", catalogReadErrorDetail(err))
+			}
 		} else if decryptor == nil {
-			logf("catalog decrypt failed")
+			logf("catalog decrypt failed: decryptor unavailable")
 		} else {
 			raw, err = decryptor.Decrypt(ctx, strings.TrimSpace(string(blob)), uid)
 			if err != nil {
-				logf("catalog decrypt failed")
+				logf("catalog decrypt failed: %s", catalogDecryptErrorDetail(err))
 				raw = nil
 			}
 		}

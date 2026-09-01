@@ -255,14 +255,27 @@ func TestNativeContextFactoryUsesOverrideWASMNewTranscriptAndPreservesCallerFiel
 		t.Fatalf("native context concrete type = %T", created)
 	}
 	nativeCtx.mu.RLock()
-	effective := nativeCtx.user
-	effective.OrganizationTags = slices.Clone(effective.OrganizationTags)
+	effective := cloneNativeProtocolUserInfo(nativeCtx.user)
 	nativeCtx.mu.RUnlock()
 	if effective.EncryptUserInfo != config.User.EncryptUserInfo || effective.Key != config.User.Key {
 		t.Fatal("native context did not preserve caller runtime fields")
 	}
 	if !reflect.DeepEqual(effective.OrganizationTags, config.User.OrganizationTags) {
 		t.Fatal("native context changed organization tags during New")
+	}
+
+	prepareHost := &nativeInferOrderedHost{
+		now:     time.UnixMilli(protocolFixtureUnixMilli),
+		entropy: nativeInferVectorEntropy(),
+	}
+	prepareCtx := withProtocolHostDeps(context.Background(), protocolHostDeps{Clock: prepareHost, Entropy: prepareHost})
+	prepared, err := created.PrepareInferRequest(prepareCtx, nativeInferVectorInput())
+	if err != nil {
+		t.Fatalf("native context PrepareInferRequest returned kind %q", protocolErrorKindOf(err))
+	}
+	payload, _ := nativeInferAuthorizationForTest(t, prepared.Header)
+	if prepared.Header.Get("Cosy-Key") != config.User.Key || payload.Info != config.User.EncryptUserInfo {
+		t.Fatal("prepared request did not use caller runtime fields")
 	}
 }
 
@@ -279,7 +292,14 @@ func TestNativeContextFactoryCopiesConfigAndPreservesTagShape(t *testing.T) {
 			config.User.OrganizationID = ""
 			want := config
 			want.User.OrganizationTags = slices.Clone(config.User.OrganizationTags)
-			factory := &nativeContextFactory{host: validNativeContextHost()}
+			ignoredGenerated := runtimeFieldOutput{
+				EncryptUserInfo: "synthetic-copy-generated-info",
+				Key:             "synthetic-copy-generated-key",
+			}
+			factory := &nativeContextFactory{
+				host:          validNativeContextHost(),
+				runtimeFields: &nativeContextRuntimeGeneratorFake{consume: true, output: ignoredGenerated},
+			}
 			created, err := factory.New(context.Background(), config)
 			if err != nil {
 				t.Fatalf("tag-shape New returned kind %q", protocolErrorKindOf(err))
@@ -827,6 +847,29 @@ func TestNativeProtocolContextRejectsNilAndUnsafePreparerResults(t *testing.T) {
 			t.Fatal("wrapped cancellation exposed internal content")
 		}
 	})
+
+	for _, tt := range []struct {
+		name string
+		want error
+	}{
+		{name: "protocol error wrapping cancellation", want: context.Canceled},
+		{name: "protocol error wrapping deadline", want: context.DeadlineExceeded},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			wrapped := newProtocolError(
+				protocolBackendFailure,
+				"Qoder protocol operation failed",
+				fmt.Errorf("synthetic prepare context failure: %w", tt.want),
+			)
+			nativeCtx := newNativeProtocolContextForTest(t, func(context.Context, nativeContextSnapshot, inferRequestInput) (*preparedRequest, error) {
+				return nil, wrapped
+			})
+			prepared, err := nativeCtx.PrepareInferRequest(context.Background(), inferRequestInput{})
+			if prepared != nil || !errors.Is(err, tt.want) {
+				t.Fatalf("PrepareInferRequest() = (%#v, %v), want %v", prepared, err, tt.want)
+			}
+		})
+	}
 }
 
 func TestRuntimeFieldsPersistedWASMInteropThroughNativeContext(t *testing.T) {

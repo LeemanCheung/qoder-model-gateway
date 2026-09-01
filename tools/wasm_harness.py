@@ -19,11 +19,12 @@ PINNED_WASM_SIZE = 297238
 PINNED_WASM_SHA256 = "b3ddd7c9235cea51a965582506fa6281bb298ddab782ff3edb3f9015da2468d4"
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_FIXTURES = os.path.join(REPO_ROOT, "testdata", "protocol", "1.1.34")
-FIXTURE_NAMES = ("runtime-fields.json", "credential.json", "model-cache.json", "infer-user.json")
+FIXTURE_NAMES = ("runtime-fields.json", "credential.json", "model-cache.json", "infer-user.json", "infer-user-no-org.json")
 FIXTURE_JSON_NAMES = frozenset(FIXTURE_NAMES + ("manifest.json",))
 ORACLE_IDENTITY = {"version": "1.1.34", "size": PINNED_WASM_SIZE, "sha256": PINNED_WASM_SHA256}
 PINNED_FIXTURE_HASHES = {
     "credential.json": "07b80f1d48141d763dab7065465b0bd531ae8e490f56a1999322b2faa1d29574",
+    "infer-user-no-org.json": "1f7d66201ff1b3d25890cd4399d2aca67b582d938d715f2f0fb048a62e0e78d6",
     "infer-user.json": "9732d0ca933bcf53e2e26e09b0e6a8ec46bd310ce925a8c2b74f24ab6f9b99ed",
     "model-cache.json": "7c9dd168e83f6461b1826aae6b475c6ed419f5b9f45b4bfbecfbfd9617407cc8",
     "runtime-fields.json": "9ab327de55b7ece6d429783152b77298c3b0eb1a51776213741ba8784954aaf0",
@@ -500,6 +501,30 @@ def require_exact_keys(value, keys, category="fixture-schema"):
         raise HarnessError(category)
 
 
+def expected_single_header(headers, name):
+    matches = [values for key, values in headers.items() if str(key).lower() == name.lower()]
+    if len(matches) != 1 or not isinstance(matches[0], list) or len(matches[0]) != 1 or not isinstance(matches[0][0], str):
+        raise HarnessError("fixture-synthetic-schema")
+    return matches[0][0]
+
+
+def expected_authorization_payload(headers):
+    authorization = expected_single_header(headers, "Authorization")
+    prefix = "Bearer COSY."
+    if not authorization.startswith(prefix):
+        raise HarnessError("fixture-synthetic-schema")
+    parts = authorization[len(prefix):].split(".")
+    if len(parts) != 2 or len(parts[1]) != 32:
+        raise HarnessError("fixture-synthetic-schema")
+    try:
+        raw = base64.b64decode(parts[0], validate=True)
+        payload = json.loads(raw.decode("utf-8"))
+    except (ValueError, TypeError, UnicodeDecodeError) as error:
+        raise HarnessError("fixture-synthetic-schema") from error
+    require_exact_keys(payload, ("version", "requestId", "info", "cosyVersion", "ideVersion"), "fixture-synthetic-schema")
+    return payload
+
+
 def validate_fixture_schema(name, fixture):
     require_exact_keys(fixture, ("oracle", "input", "transcript", "expected"))
     if fixture["oracle"] != ORACLE_IDENTITY:
@@ -541,13 +566,44 @@ def validate_fixture_schema(name, fixture):
         require_exact_keys(expected, ("decrypted", "encrypted"))
         if input_value["uid"] != "synthetic-user-0001" or input_value["plain"] != expected["decrypted"]:
             raise HarnessError("fixture-synthetic-schema")
-    elif name == "infer-user.json":
+    elif name in ("infer-user.json", "infer-user-no-org.json"):
         require_exact_keys(input_value, ("machine_id", "version", "user", "scene", "endpoint", "body_raw", "model_key", "model_source"))
         require_exact_keys(expected, ("url", "header", "body_string", "body_bytes"))
         if input_value["machine_id"] != "00000000-1111-4222-8333-444444444444" or input_value["version"] != "1.1.34" or input_value["endpoint"] != "https://example.invalid/base":
             raise HarnessError("fixture-synthetic-schema")
-        if input_value["user"].get("uid") != "synthetic-user-0001" or input_value["user"].get("organization_id") != "synthetic-org-0001":
+        if input_value["user"].get("uid") != "synthetic-user-0001":
             raise HarnessError("fixture-synthetic-schema")
+        if name == "infer-user.json":
+            if input_value["user"].get("organization_id") != "synthetic-org-0001" or input_value["model_key"] != "auto" or input_value["model_source"] != "system":
+                raise HarnessError("fixture-synthetic-schema")
+        else:
+            want_user = {
+                "uid": "synthetic-user-0001",
+                "encrypt_user_info": "synthetic-caller-info-not-effective",
+                "key": "synthetic-caller-key-not-effective",
+                "organization_id": "",
+                "organization_tags": [],
+                "data_policy_agreed": False,
+            }
+            if input_value["user"] != want_user or input_value["model_key"] != "" or input_value["model_source"] != "system":
+                raise HarnessError("fixture-synthetic-schema")
+            headers = expected["header"]
+            if not isinstance(headers, dict) or len(headers) != 18:
+                raise HarnessError("fixture-synthetic-schema")
+            for header in ("Cosy-Organization-Id", "Cosy-Organization-Tags", "X-Model-Key", "X-Model-Source"):
+                if any(str(key).lower() == header.lower() for key in headers):
+                    raise HarnessError("fixture-synthetic-schema")
+            if expected_single_header(headers, "Cosy-Key") != want_user["key"] or expected_single_header(headers, "Cosy-Data-Policy") != "disagree":
+                raise HarnessError("fixture-synthetic-schema")
+            payload = expected_authorization_payload(headers)
+            if payload != {
+                "version": "v1",
+                "requestId": "8d8c8b8a-8988-4786-8584-838281807f7e",
+                "info": want_user["encrypt_user_info"],
+                "cosyVersion": "1.1.34",
+                "ideVersion": "",
+            }:
+                raise HarnessError("fixture-synthetic-schema")
     else:
         raise HarnessError("fixture-schema")
 
@@ -573,6 +629,13 @@ def validate_fixture_set(directory):
             raise HarnessError("fixture-document-hash")
         validate_fixture_schema(name, fixture)
         fixtures[name] = fixture
+    runtime_expected = fixtures["runtime-fields.json"]["expected"]
+    infer_user = fixtures["infer-user.json"]["input"]["user"]
+    no_org_user = fixtures["infer-user-no-org.json"]["input"]["user"]
+    if infer_user["encrypt_user_info"] != runtime_expected["encrypt_user_info"] or infer_user["key"] != runtime_expected["key"]:
+        raise HarnessError("fixture-synthetic-schema")
+    if no_org_user["encrypt_user_info"] == runtime_expected["encrypt_user_info"] or no_org_user["key"] == runtime_expected["key"]:
+        raise HarnessError("fixture-synthetic-schema")
     return fixtures
 
 
@@ -588,44 +651,7 @@ def actual_header_map(value):
     return {str(key).lower(): str(entry) for key, entry in value.items()}
 
 
-def verify_fixtures(wasm_bytes, fixtures):
-    wasm = WasmBound(wasm_bytes)
-
-    fixture = fixtures["credential.json"]
-    replay = TranscriptReplay.from_fixture(fixture["transcript"], [])
-    wasm.set_replay(replay)
-    encrypted = wasm.credential_encrypt(fixture["input"]["plain"], fixture["input"]["machine_key"])
-    decrypted = wasm.credential_decrypt(encrypted, fixture["input"]["machine_key"])
-    replay.exhausted()
-    if encrypted != fixture["expected"]["encrypted"] or decrypted != fixture["expected"]["decrypted"]:
-        raise HarnessError("credential-output")
-    print(safe_line("credential", replay.shape(), True))
-
-    fixture = fixtures["runtime-fields.json"]
-    entropy_lengths = [entry["length"] for entry in fixture["transcript"]["entropy_reads"]]
-    replay = TranscriptReplay.from_fixture(fixture["transcript"], [("entropy", length) for length in entropy_lengths])
-    wasm.set_replay(replay)
-    raw = wasm.gen_runtime_auth_fields(fixture["input"]["raw"])
-    replay.exhausted()
-    if raw != fixture["expected"]["raw"]:
-        raise HarnessError("runtime-output")
-    print(safe_line("runtime", replay.shape(), True))
-
-    fixture = fixtures["model-cache.json"]
-    entropy_lengths = [entry["length"] for entry in fixture["transcript"]["entropy_reads"]]
-    replay = TranscriptReplay.from_fixture(fixture["transcript"], [("entropy", length) for length in entropy_lengths])
-    wasm.set_replay(replay)
-    encrypted = wasm.model_cache_encrypt(fixture["input"]["plain"], fixture["input"]["uid"])
-    replay.exhausted()
-    decrypt_replay = TranscriptReplay([], [], [])
-    wasm.set_replay(decrypt_replay)
-    decrypted = wasm.model_cache_decrypt(encrypted, fixture["input"]["uid"])
-    decrypt_replay.exhausted()
-    if encrypted != fixture["expected"]["encrypted"] or decrypted != fixture["expected"]["decrypted"]:
-        raise HarnessError("model-cache-output")
-    print(safe_line("model-cache", replay.shape(), True))
-
-    fixture = fixtures["infer-user.json"]
+def verify_infer_fixture(wasm, fixture, operation):
     transcript = fixture["transcript"]
     reads = transcript["entropy_reads"]
     new_transcript = {"unix_milli": [], "entropy_reads": reads[:2]}
@@ -666,7 +692,48 @@ def verify_fixtures(wasm_bytes, fixtures):
     if actual_header_map(headers) != expected_header_map(expected["header"]):
         raise HarnessError("infer-headers")
     combined_shape = f"new[{new_replay.shape()}],prepare[{prepare_replay.shape()}]"
-    print(safe_line("infer", combined_shape, True))
+    print(safe_line(operation, combined_shape, True))
+
+
+def verify_fixtures(wasm_bytes, fixtures):
+    wasm = WasmBound(wasm_bytes)
+
+    fixture = fixtures["credential.json"]
+    replay = TranscriptReplay.from_fixture(fixture["transcript"], [])
+    wasm.set_replay(replay)
+    encrypted = wasm.credential_encrypt(fixture["input"]["plain"], fixture["input"]["machine_key"])
+    decrypted = wasm.credential_decrypt(encrypted, fixture["input"]["machine_key"])
+    replay.exhausted()
+    if encrypted != fixture["expected"]["encrypted"] or decrypted != fixture["expected"]["decrypted"]:
+        raise HarnessError("credential-output")
+    print(safe_line("credential", replay.shape(), True))
+
+    fixture = fixtures["runtime-fields.json"]
+    entropy_lengths = [entry["length"] for entry in fixture["transcript"]["entropy_reads"]]
+    replay = TranscriptReplay.from_fixture(fixture["transcript"], [("entropy", length) for length in entropy_lengths])
+    wasm.set_replay(replay)
+    raw = wasm.gen_runtime_auth_fields(fixture["input"]["raw"])
+    replay.exhausted()
+    if raw != fixture["expected"]["raw"]:
+        raise HarnessError("runtime-output")
+    print(safe_line("runtime", replay.shape(), True))
+
+    fixture = fixtures["model-cache.json"]
+    entropy_lengths = [entry["length"] for entry in fixture["transcript"]["entropy_reads"]]
+    replay = TranscriptReplay.from_fixture(fixture["transcript"], [("entropy", length) for length in entropy_lengths])
+    wasm.set_replay(replay)
+    encrypted = wasm.model_cache_encrypt(fixture["input"]["plain"], fixture["input"]["uid"])
+    replay.exhausted()
+    decrypt_replay = TranscriptReplay([], [], [])
+    wasm.set_replay(decrypt_replay)
+    decrypted = wasm.model_cache_decrypt(encrypted, fixture["input"]["uid"])
+    decrypt_replay.exhausted()
+    if encrypted != fixture["expected"]["encrypted"] or decrypted != fixture["expected"]["decrypted"]:
+        raise HarnessError("model-cache-output")
+    print(safe_line("model-cache", replay.shape(), True))
+
+    verify_infer_fixture(wasm, fixtures["infer-user.json"], "infer")
+    verify_infer_fixture(wasm, fixtures["infer-user-no-org.json"], "infer-no-org")
 
 
 def isolated_go_environment(source=None):
@@ -730,6 +797,7 @@ def verify_with_go_backend(wasm_path, fixture_directory):
         {"operation": "runtime", "transcript": "clock:0,entropy:16,109", "result": "PASS"},
         {"operation": "model-cache", "transcript": "clock:0,entropy:12", "result": "PASS"},
         {"operation": "infer", "transcript": "new[clock:0,entropy:16,109],prepare[clock:1,entropy:16]", "result": "PASS"},
+        {"operation": "infer-no-org", "transcript": "new[clock:0,entropy:16,109],prepare[clock:1,entropy:16]", "result": "PASS"},
     ]
     lines = parse_go_records(completed, expected_records, "backend-go-verify")
     for line in lines:

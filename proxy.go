@@ -259,7 +259,7 @@ func (s *server) handleMessages(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := s.callUpstream(r.Context(), body, mc, requestID[:8])
 	if err != nil {
-		s.logf("req %s upstream error: %v", requestID[:8], err)
+		s.logUpstreamError(requestID[:8], err)
 		writeAnthropicError(w, 502, "api_error", "upstream request failed: "+err.Error())
 		return
 	}
@@ -336,6 +336,13 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 	}
 }
 
+func (s *server) logUpstreamError(requestID string, err error) {
+	if s == nil || s.logf == nil {
+		return
+	}
+	s.logf("req %s upstream error: %v", requestID, protocolDiagnosticError(err))
+}
+
 // callUpstream performs the upstream call with retries for auth expiry,
 // rate limits, gateway errors and server-side queueing.
 func (s *server) callUpstream(ctx context.Context, body []byte, mc *modelConfig, rid string) (*http.Response, error) {
@@ -344,7 +351,7 @@ func (s *server) callUpstream(ctx context.Context, body []byte, mc *modelConfig,
 		resp, err := s.doUpstream(ctx, body, mc)
 		if err != nil {
 			if attempt < maxAttempts {
-				s.logf("req %s upstream transport error (attempt %d/%d): %v", rid, attempt, maxAttempts, err)
+				s.logf("req %s upstream transport error (attempt %d/%d): %v", rid, attempt, maxAttempts, protocolDiagnosticError(err))
 				if !sleepCtx(ctx, time.Duration(attempt)*time.Second) {
 					return nil, ctx.Err()
 				}

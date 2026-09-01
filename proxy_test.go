@@ -4,12 +4,15 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"reflect"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -75,6 +78,25 @@ func resolverTestCatalog() []*modelConfig {
 func TestServerHasNoWASMDependency(t *testing.T) {
 	if _, ok := reflect.TypeOf(server{}).FieldByName("wasm"); ok {
 		t.Fatal("server still has concrete wasm dependency")
+	}
+}
+
+func TestServerLogUpstreamErrorUsesDiagnosticWithoutChangingReturnedError(t *testing.T) {
+	cause := errors.New("synthetic operator diagnostic cause")
+	classified := newProtocolError(protocolAuthUnavailable, "Authentication is unavailable", cause)
+	returned := fmt.Errorf("prepareInferRequest: %w", classified)
+	var logs strings.Builder
+	s := &server{logf: func(format string, args ...any) {
+		fmt.Fprintf(&logs, format+"\n", args...)
+	}}
+
+	s.logUpstreamError("synthetic", returned)
+	if !strings.Contains(logs.String(), "prepareInferRequest: Authentication is unavailable") ||
+		!strings.Contains(logs.String(), cause.Error()) {
+		t.Fatalf("operator log lacks public/internal stages: %q", logs.String())
+	}
+	if strings.Contains(returned.Error(), cause.Error()) {
+		t.Fatalf("returned error leaked internal cause: %q", returned)
 	}
 }
 

@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-func TestProtocolErrorHidesInternalCause(t *testing.T) {
+func TestProtocolErrorHidesInternalCauseFromPublicStringAndUnwraps(t *testing.T) {
 	cause := errors.New("SENTINEL-PROTOCOL-SECRET")
 	err := newProtocolError(protocolBackendIncompatible, "protocol backend is incompatible", cause)
 
@@ -17,8 +17,40 @@ func TestProtocolErrorHidesInternalCause(t *testing.T) {
 	if got := protocolErrorKindOf(err); got != protocolBackendIncompatible {
 		t.Fatalf("protocolErrorKindOf() = %q, want %q", got, protocolBackendIncompatible)
 	}
-	if errors.Is(err, cause) {
-		t.Fatal("protocolError must not unwrap its internal cause")
+	if !errors.Is(err, cause) {
+		t.Fatal("protocolError does not unwrap its internal cause")
+	}
+	var target *protocolError
+	if !errors.As(err, &target) || target == nil || target.kind != protocolBackendIncompatible {
+		t.Fatalf("errors.As() = %#v, want backend-incompatible protocolError", target)
+	}
+}
+
+func TestProtocolDiagnosticErrorKeepsPublicStageAndInternalCause(t *testing.T) {
+	cause := errors.New("synthetic diagnostic cause")
+	classified := newProtocolError(
+		protocolBackendFailure,
+		"Qoder protocol operation failed",
+		fmt.Errorf("read native inference clock: %w", cause),
+	)
+	wrapped := fmt.Errorf("prepareInferRequest: %w", classified)
+
+	diagnostic := protocolDiagnosticError(wrapped)
+	if diagnostic == nil || !errors.Is(diagnostic, cause) {
+		t.Fatalf("diagnostic = %v, want internal cause", diagnostic)
+	}
+	if !strings.Contains(diagnostic.Error(), "prepareInferRequest: Qoder protocol operation failed") ||
+		!strings.Contains(diagnostic.Error(), "read native inference clock") {
+		t.Fatalf("diagnostic lacks safe stage detail: %q", diagnostic)
+	}
+	if wrapped.Error() != "prepareInferRequest: Qoder protocol operation failed" {
+		t.Fatalf("public wrapped error changed: %q", wrapped)
+	}
+}
+
+func TestProtocolDiagnosticErrorNil(t *testing.T) {
+	if got := protocolDiagnosticError(nil); got != nil {
+		t.Fatalf("protocolDiagnosticError(nil) = %v", got)
 	}
 }
 

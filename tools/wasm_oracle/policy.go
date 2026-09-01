@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"io"
 	"reflect"
+	"strings"
 )
 
 const (
@@ -17,6 +18,8 @@ const (
 	syntheticMachineKey     = "00000000-1111-42"
 	syntheticEndpoint       = "https://example.invalid/base"
 	syntheticUnixMilli      = int64(1781000123456)
+	noOrgCallerInfo         = "synthetic-caller-info-not-effective"
+	noOrgCallerKey          = "synthetic-caller-key-not-effective"
 	credentialPlain         = `{"uid":"synthetic-user-0001","organization_id":"synthetic-org-0001","access_token":"synthetic-access-token-0001"}`
 	runtimePlain            = `{"uid":"synthetic-user-0001","organization_id":"synthetic-org-0001","organization_tags":["synthetic-a","b"],"data_policy_agreed":true}`
 	modelCachePlain         = `{"models":[{"id":"synthetic-model-0001"}]}`
@@ -99,6 +102,13 @@ type inferFixtureExpectedPolicy struct {
 	Header     map[string][]string `json:"header"`
 	BodyString string              `json:"body_string"`
 	BodyBytes  string              `json:"body_bytes"`
+}
+type inferAuthorizationPayloadPolicy struct {
+	Version     string `json:"version"`
+	RequestID   string `json:"requestId"`
+	Info        string `json:"info"`
+	CosyVersion string `json:"cosyVersion"`
+	IDEVersion  string `json:"ideVersion"`
 }
 type remoteBody struct {
 	AgentID        string          `json:"agent_id"`
@@ -203,7 +213,7 @@ func validateTranscript(name string, value transcript) error {
 		lengths, starts = []int{16, 109}, []byte{1, 17}
 	case "model-cache.json":
 		lengths, starts = []int{12}, []byte{1}
-	case "infer-user.json":
+	case "infer-user.json", "infer-user-no-org.json":
 		lengths, starts, clocks = []int{16, 109, 16}, []byte{1, 17, 126}, []int64{syntheticUnixMilli}
 	default:
 		return fail("fixture-schema")
@@ -276,6 +286,19 @@ func validateNestedFixture(name string, fixture fixtureDocument) error {
 		if err := validateInferExpected(input, expected); err != nil {
 			return err
 		}
+	case "infer-user-no-org.json":
+		var input inferFixtureInputPolicy
+		var expected inferFixtureExpectedPolicy
+		var body remoteBody
+		if decodeStrictValue(fixture.Input, &input) != nil || decodeStrictValue(fixture.Expected, &expected) != nil || decodeStrictValue([]byte(input.BodyRaw), &body) != nil {
+			return fail("fixture-synthetic-schema")
+		}
+		if err := validateNoOrgInferInput(input, body); err != nil {
+			return err
+		}
+		if err := validateNoOrgInferExpected(input, expected); err != nil {
+			return err
+		}
 	default:
 		return fail("fixture-schema")
 	}
@@ -288,6 +311,19 @@ func validateInferInput(input inferFixtureInputPolicy, body remoteBody) error {
 	if input.MachineID != syntheticMachineID || input.Version != pinnedVersion || !reflect.DeepEqual(input.User, wantUser) || stringHash(input.User.EncryptUserInfo) != runtimeInfoHash || stringHash(input.User.Key) != runtimeKeyHash || input.Scene != wantScene || input.Endpoint != syntheticEndpoint || input.ModelKey != "auto" || input.ModelSource != "system" || stringHash(input.BodyRaw) != inferBodyRawHash {
 		return fail("fixture-synthetic-schema")
 	}
+	return validateInferBody(body)
+}
+
+func validateNoOrgInferInput(input inferFixtureInputPolicy, body remoteBody) error {
+	wantUser := inferUser{syntheticUID, noOrgCallerInfo, noOrgCallerKey, "", []string{}, false}
+	wantScene := inferScene{"5", "cli", "agent", "assistant"}
+	if input.MachineID != syntheticMachineID || input.Version != pinnedVersion || !reflect.DeepEqual(input.User, wantUser) || input.Scene != wantScene || input.Endpoint != syntheticEndpoint || input.ModelKey != "" || input.ModelSource != "system" || stringHash(input.BodyRaw) != inferBodyRawHash {
+		return fail("fixture-synthetic-schema")
+	}
+	return validateInferBody(body)
+}
+
+func validateInferBody(body remoteBody) error {
 	if body.AgentID != "agent_common" || body.AliyunUserType != "" || body.Business != (remoteBusiness{syntheticUnixMilli, "synthetic-business-0001", "synthetic-", "cli", "start", "agent", pinnedVersion}) || string(body.ChatContext) != "{}" || body.ChatRecordID != "synthetic-request-0001" || body.ChatTask != "FREE_INPUT" || string(body.CustomModel) != "null" || !body.IsReply || body.IsRetry || body.RequestID != "synthetic-request-0001" || body.RequestSetID != "synthetic-request-0001" || body.SessionID != "synthetic-session-0001" || body.SessionType != "qodercli" || body.Source != 1 || !body.Stream || body.System != "synthetic-system-prompt-0001" || body.TaskID != "common" || body.Version != "3" {
 		return fail("fixture-synthetic-schema")
 	}
@@ -331,13 +367,85 @@ func validateInferExpected(input inferFixtureInputPolicy, expected inferFixtureE
 	return nil
 }
 
+func inferExpectedHeader(header map[string][]string, name string) ([]string, bool) {
+	for key, values := range header {
+		if strings.EqualFold(key, name) {
+			return values, true
+		}
+	}
+	return nil, false
+}
+
+func inferExpectedAuthorizationPayload(expected inferFixtureExpectedPolicy) (inferAuthorizationPayloadPolicy, error) {
+	var payload inferAuthorizationPayloadPolicy
+	auth, ok := inferExpectedHeader(expected.Header, "Authorization")
+	if !ok || len(auth) != 1 || !strings.HasPrefix(auth[0], "Bearer COSY.") {
+		return payload, fail("fixture-synthetic-schema")
+	}
+	parts := strings.Split(strings.TrimPrefix(auth[0], "Bearer COSY."), ".")
+	if len(parts) != 2 || len(parts[1]) != 32 {
+		return payload, fail("fixture-synthetic-schema")
+	}
+	raw, err := base64.StdEncoding.Strict().DecodeString(parts[0])
+	if err != nil || decodeStrictValue(raw, &payload) != nil {
+		return payload, fail("fixture-synthetic-schema")
+	}
+	return payload, nil
+}
+
+func validateNoOrgInferExpected(input inferFixtureInputPolicy, expected inferFixtureExpectedPolicy) error {
+	const expectedURL = "https://example.invalid/base/algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1"
+	decodedBody, err := base64.StdEncoding.Strict().DecodeString(expected.BodyBytes)
+	if err != nil || string(decodedBody) != expected.BodyString || stringHash(expected.BodyString) != inferBodyHash || expected.URL != expectedURL {
+		return fail("fixture-synthetic-schema")
+	}
+	want := map[string]string{
+		"Accept": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive", "Content-Type": "application/json",
+		"Cosy-Business-Product": "cli", "Cosy-Business-Type": "agent", "Cosy-ClientType": "5", "Cosy-Data-Policy": "disagree",
+		"Cosy-Date": "1781000123", "Cosy-Key": input.User.Key, "Cosy-MachineId": syntheticMachineID, "Cosy-MachineToken": syntheticMachineID,
+		"Cosy-MachineType": "5", "Cosy-Scene": "assistant", "Cosy-User": syntheticUID, "Cosy-Version": pinnedVersion, "Login-Version": "v2",
+	}
+	if len(expected.Header) != len(want)+1 {
+		return fail("fixture-synthetic-schema")
+	}
+	for key, value := range want {
+		values, ok := inferExpectedHeader(expected.Header, key)
+		if !ok || !reflect.DeepEqual(values, []string{value}) {
+			return fail("fixture-synthetic-schema")
+		}
+	}
+	for _, name := range []string{"Cosy-Organization-Id", "Cosy-Organization-Tags", "X-Model-Key", "X-Model-Source"} {
+		if _, ok := inferExpectedHeader(expected.Header, name); ok {
+			return fail("fixture-synthetic-schema")
+		}
+	}
+	payload, err := inferExpectedAuthorizationPayload(expected)
+	if err != nil || payload.Version != "v1" || payload.RequestID != "8d8c8b8a-8988-4786-8584-838281807f7e" || payload.Info != input.User.EncryptUserInfo || payload.CosyVersion != pinnedVersion || payload.IDEVersion != "" {
+		return fail("fixture-synthetic-schema")
+	}
+	return nil
+}
+
 func validateCrossFixtureRelationships(fixtures fixtureSet) error {
 	var runtimeExpected runtimeFixtureExpected
 	var inferInput inferFixtureInputPolicy
-	if decodeStrictValue(fixtures["runtime-fields.json"].Expected, &runtimeExpected) != nil || decodeStrictValue(fixtures["infer-user.json"].Input, &inferInput) != nil {
+	var noOrgInput inferFixtureInputPolicy
+	var noOrgExpected inferFixtureExpectedPolicy
+	if decodeStrictValue(fixtures["runtime-fields.json"].Expected, &runtimeExpected) != nil ||
+		decodeStrictValue(fixtures["infer-user.json"].Input, &inferInput) != nil ||
+		decodeStrictValue(fixtures["infer-user-no-org.json"].Input, &noOrgInput) != nil ||
+		decodeStrictValue(fixtures["infer-user-no-org.json"].Expected, &noOrgExpected) != nil {
 		return fail("fixture-synthetic-schema")
 	}
 	if inferInput.User.EncryptUserInfo != runtimeExpected.EncryptUserInfo || inferInput.User.Key != runtimeExpected.Key {
+		return fail("fixture-synthetic-schema")
+	}
+	if noOrgInput.User.EncryptUserInfo == runtimeExpected.EncryptUserInfo || noOrgInput.User.Key == runtimeExpected.Key {
+		return fail("fixture-synthetic-schema")
+	}
+	payload, err := inferExpectedAuthorizationPayload(noOrgExpected)
+	key, ok := inferExpectedHeader(noOrgExpected.Header, "Cosy-Key")
+	if err != nil || !ok || len(key) != 1 || payload.Info != noOrgInput.User.EncryptUserInfo || key[0] != noOrgInput.User.Key {
 		return fail("fixture-synthetic-schema")
 	}
 	return nil

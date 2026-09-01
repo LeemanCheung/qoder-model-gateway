@@ -67,6 +67,8 @@ Content-Type: application/json
 
 `expire_time - 3600 < now` 时提前刷新；每次用 token 前检查，后台每 30 分钟检查一次。当前 inference retry 只有在 **attempt 1 本身返回 401** 时才调用 `forceRefresh`，刷新成功后立即 retry 一次；如果先前已经发生 transport/status retry，后续 attempt 才返回 401，则直接返回该 401，不触发 refresh。刷新响应中的 token rotation 会先保留在内存中，再原子保存。
 
+首次 browser/PAT login 的 credential publish 仍是 fail-closed，必须成功后才提交登录状态。已接受的新 token 与 replacement context 则以记忆体可用性为优先：后续 credential 保存失败时保留 `credentialDirty`，记录不含 credential 内容的内部原因，并在 30 秒 deadline 前跳过重复写入；deadline 到后由下一次 demand/background freshness check 重试。该持久化失败不会拒绝 inference，也不会重新请求 refresh endpoint。`Close` 忽略 retry deadline，强制执行最后一次 flush 并把失败返回给 operator。
+
 ## 4. credential 文件格式
 
 | 项 | 精确格式 |
@@ -81,7 +83,7 @@ Content-Type: application/json
 
 项目加载时保留兼容行为：若去除文件外围空白后内容以 `{` 开头，则按明文 JSON 解析；否则严格按上述格式解密。保存始终写加密格式，不写明文 fallback。
 
-保存是唯一 temp-file 原子路径：在目标目录创建 `.user-*` 临时文件，立即 chmod `0600`，完整写入、`fsync`、关闭后 `rename` 到最终文件；失败时删除 temp。并发保存不会把两个 ciphertext 交叉写入，最终文件仍是一个完整的 `0600` 普通文件。
+保存是唯一 temp-file 原子路径：在目标目录创建 `.user-*` 临时文件，立即 chmod `0600`，完整写入、`fsync`、关闭后 `rename` 到最终文件；失败时删除 temp。并发保存不会把两个 ciphertext 交叉写入，最终文件仍是一个完整的 `0600` 普通文件。best-effort 只改变刷新成功后的错误传播与重试节流；每一次实际写入仍完整经过这条原子路径。
 
 ## 5. runtime auth fields
 

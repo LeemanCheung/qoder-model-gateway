@@ -330,7 +330,7 @@ func (s *server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	s.logf("req %s chat model=%s->%s stream=%v bytes=%d msgs=%d tools=%d", requestID[:8], req.Model, mc.Key, req.Stream, len(raw), len(req.Messages), len(req.Tools))
 	resp, err := s.callUpstream(r.Context(), body, mc, requestID[:8])
 	if err != nil {
-		s.logf("req %s upstream error: %v", requestID[:8], err)
+		s.logUpstreamError(requestID[:8], err)
 		writeOAIError(w, 502, "api_error", "", "upstream request failed: "+err.Error())
 		return
 	}

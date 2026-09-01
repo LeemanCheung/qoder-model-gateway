@@ -199,6 +199,43 @@ func TestLoadCatalogNativeQMCV1FailuresRetainBuiltinCatalog(t *testing.T) {
 	}
 }
 
+func TestCatalogReadErrorDetailOmitsPath(t *testing.T) {
+	const path = "/SENTINEL-DYNAMIC-CATALOG-UID/catalog-v6"
+	err := &os.PathError{Op: "open", Path: path, Err: os.ErrPermission}
+	detail := catalogReadErrorDetail(err)
+	if !strings.Contains(detail, "open") || !strings.Contains(detail, os.ErrPermission.Error()) {
+		t.Fatalf("detail = %q, want operation and errno", detail)
+	}
+	if strings.Contains(detail, path) || strings.Contains(detail, "SENTINEL-DYNAMIC-CATALOG-UID") {
+		t.Fatalf("detail leaked path: %q", detail)
+	}
+}
+
+func TestCatalogDecryptErrorDetailUsesTypedProtocolCauseButHidesArbitraryText(t *testing.T) {
+	typed := newProtocolError(
+		protocolBackendIncompatible,
+		"model cache data is incompatible",
+		errors.New("model cache envelope authentication failed"),
+	)
+	typedDetail := catalogDecryptErrorDetail(typed)
+	if !strings.Contains(typedDetail, string(protocolBackendIncompatible)) ||
+		!strings.Contains(typedDetail, "authentication failed") {
+		t.Fatalf("typed detail = %q", typedDetail)
+	}
+
+	arbitrary := errors.New("SENTINEL-DYNAMIC-CATALOG-ERROR")
+	arbitraryDetail := catalogDecryptErrorDetail(arbitrary)
+	if strings.Contains(arbitraryDetail, arbitrary.Error()) || arbitraryDetail == "" {
+		t.Fatalf("arbitrary detail = %q", arbitraryDetail)
+	}
+
+	wrappedCancellation := fmt.Errorf("SENTINEL-CATALOG-CANCELLATION: %w", context.Canceled)
+	cancellationDetail := catalogDecryptErrorDetail(wrappedCancellation)
+	if cancellationDetail != context.Canceled.Error() {
+		t.Fatalf("wrapped cancellation detail = %q, want %q", cancellationDetail, context.Canceled)
+	}
+}
+
 func TestLoadCatalogDynamicCacheLoggingIsValueFree(t *testing.T) {
 	const uid = "SENTINEL-DYNAMIC-CATALOG-UID"
 	const blob = "SENTINEL-DYNAMIC-CATALOG-BLOB"
@@ -224,22 +261,42 @@ func TestLoadCatalogDynamicCacheLoggingIsValueFree(t *testing.T) {
 		assertCatalogLogOmits(t, output, uid, blob, plain, cachePath, "SENTINEL-DYNAMIC-CATALOG-ERROR")
 	})
 
-	t.Run("read failure", func(t *testing.T) {
+	t.Run("typed decrypt failure includes safe detail", func(t *testing.T) {
 		root := t.TempDir()
 		authFile := filepath.Join(root, ".auth", "user")
-		cachePath := filepath.Clean(filepath.Join(filepath.Dir(authFile), "..", ".models", uid, "catalog-v6"))
+		cachePath := writeDynamicCatalogCache(t, authFile, uid, blob)
+		decryptor := &fakeModelCacheDecryptor{err: newProtocolError(
+			protocolBackendIncompatible,
+			"model cache data is incompatible",
+			errors.New("model cache envelope authentication failed"),
+		)}
+		logs, logf := captureCatalogLogs()
+
+		catalog := loadCatalog(context.Background(), decryptor, authFile, uid, "", logf)
+
+		if modelByKey(catalog, "auto") == nil {
+			t.Fatal("typed decrypt failure fallback lacks builtin auto model")
+		}
+		output := logs.String()
+		if !strings.Contains(output, "kind=backend-incompatible") || !strings.Contains(output, "authentication failed") {
+			t.Fatalf("typed decrypt failure log lacks safe detail: %q", output)
+		}
+		assertCatalogLogOmits(t, output, uid, blob, cachePath)
+	})
+
+	t.Run("missing cache is silent", func(t *testing.T) {
+		root := t.TempDir()
+		authFile := filepath.Join(root, ".auth", "user")
 		logs, logf := captureCatalogLogs()
 
 		catalog := loadCatalog(context.Background(), nativeModelCacheDecryptor{}, authFile, uid, "", logf)
 
 		if modelByKey(catalog, "auto") == nil {
-			t.Fatal("read failure fallback lacks builtin auto model")
+			t.Fatal("missing cache fallback lacks builtin auto model")
 		}
-		output := logs.String()
-		if !strings.Contains(output, "catalog cache read failed") {
-			t.Fatal("read failure log lacks safe category")
+		if output := logs.String(); output != "" {
+			t.Fatalf("missing cache log = %q, want silence", output)
 		}
-		assertCatalogLogOmits(t, output, uid, cachePath)
 	})
 
 	t.Run("nil decryptor", func(t *testing.T) {

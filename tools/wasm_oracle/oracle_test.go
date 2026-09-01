@@ -92,7 +92,10 @@ func TestReadBoundedRegularFileRejectsSymlinkDirectoryAndOversize(t *testing.T) 
 	}
 }
 
-func TestFixtureInventoryIsExactlyFiveRegularFiles(t *testing.T) {
+func TestFixtureInventoryIsExactlySixRegularFiles(t *testing.T) {
+	if len(fixtureJSONNames) != 6 {
+		t.Fatalf("fixture JSON inventory length = %d, want 6", len(fixtureJSONNames))
+	}
 	dir := t.TempDir()
 	for _, name := range fixtureJSONNames {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte("{}\n"), 0o600); err != nil {
@@ -217,10 +220,11 @@ func writeSyntheticFixtureSet(t *testing.T) (string, fixturePolicy) {
 	dir := t.TempDir()
 	identity := oracleIdentity{Version: pinnedVersion, Size: pinnedWASMSize, SHA256: pinnedWASMHash}
 	docs := map[string]fixtureDocument{
-		"credential.json":     {Oracle: identity, Input: json.RawMessage(`{"machine_key":"00000000-1111-42","plain":"{\"uid\":\"synthetic-user-0001\",\"organization_id\":\"synthetic-org-0001\",\"access_token\":\"synthetic-access-token-0001\"}"}`), Transcript: transcript{}, Expected: json.RawMessage(`{"decrypted":"{\"uid\":\"synthetic-user-0001\",\"organization_id\":\"synthetic-org-0001\",\"access_token\":\"synthetic-access-token-0001\"}","encrypted":"synthetic-encrypted"}`)},
-		"runtime-fields.json": {Oracle: identity, Input: json.RawMessage(`{"raw":"{\"uid\":\"synthetic-user-0001\",\"organization_id\":\"synthetic-org-0001\"}"}`), Transcript: transcript{}, Expected: json.RawMessage(`{"raw":"{}","encrypt_user_info":"synthetic-encrypted","key":"synthetic-key"}`)},
-		"model-cache.json":    {Oracle: identity, Input: json.RawMessage(`{"plain":"{}","uid":"synthetic-user-0001"}`), Transcript: transcript{}, Expected: json.RawMessage(`{"decrypted":"{}","encrypted":"synthetic-encrypted"}`)},
-		"infer-user.json":     {Oracle: identity, Input: json.RawMessage(`{"machine_id":"00000000-1111-4222-8333-444444444444","version":"1.1.34","user":{"uid":"synthetic-user-0001","organization_id":"synthetic-org-0001"},"scene":{},"endpoint":"https://example.invalid/base","body_raw":"{}","model_key":"auto","model_source":"system"}`), Transcript: transcript{UnixMilli: []int64{1}, EntropyReads: []entropyRead{{Length: 1, Bytes: []byte{1}}}}, Expected: json.RawMessage(`{"url":"https://example.invalid","header":{},"body_string":"x","body_bytes":"eA=="}`)},
+		"credential.json":        {Oracle: identity, Input: json.RawMessage(`{"machine_key":"00000000-1111-42","plain":"{\"uid\":\"synthetic-user-0001\",\"organization_id\":\"synthetic-org-0001\",\"access_token\":\"synthetic-access-token-0001\"}"}`), Transcript: transcript{}, Expected: json.RawMessage(`{"decrypted":"{\"uid\":\"synthetic-user-0001\",\"organization_id\":\"synthetic-org-0001\",\"access_token\":\"synthetic-access-token-0001\"}","encrypted":"synthetic-encrypted"}`)},
+		"runtime-fields.json":    {Oracle: identity, Input: json.RawMessage(`{"raw":"{\"uid\":\"synthetic-user-0001\",\"organization_id\":\"synthetic-org-0001\"}"}`), Transcript: transcript{}, Expected: json.RawMessage(`{"raw":"{}","encrypt_user_info":"synthetic-encrypted","key":"synthetic-key"}`)},
+		"model-cache.json":       {Oracle: identity, Input: json.RawMessage(`{"plain":"{}","uid":"synthetic-user-0001"}`), Transcript: transcript{}, Expected: json.RawMessage(`{"decrypted":"{}","encrypted":"synthetic-encrypted"}`)},
+		"infer-user.json":        {Oracle: identity, Input: json.RawMessage(`{"machine_id":"00000000-1111-4222-8333-444444444444","version":"1.1.34","user":{"uid":"synthetic-user-0001","organization_id":"synthetic-org-0001"},"scene":{},"endpoint":"https://example.invalid/base","body_raw":"{}","model_key":"auto","model_source":"system"}`), Transcript: transcript{UnixMilli: []int64{1}, EntropyReads: []entropyRead{{Length: 1, Bytes: []byte{1}}}}, Expected: json.RawMessage(`{"url":"https://example.invalid","header":{},"body_string":"x","body_bytes":"eA=="}`)},
+		"infer-user-no-org.json": {Oracle: identity, Input: json.RawMessage(`{"machine_id":"00000000-1111-4222-8333-444444444444","version":"1.1.34","user":{"uid":"synthetic-user-0001","encrypt_user_info":"synthetic-caller-info-not-effective","key":"synthetic-caller-key-not-effective","organization_id":"","organization_tags":[],"data_policy_agreed":false},"scene":{"client_type":"5","business_product":"cli","business_type":"agent","scene":"assistant"},"endpoint":"https://example.invalid/base","body_raw":"{}","model_key":"","model_source":"system"}`), Transcript: transcript{UnixMilli: []int64{1}, EntropyReads: []entropyRead{{Length: 1, Bytes: []byte{1}}}}, Expected: json.RawMessage(`{"url":"https://example.invalid","header":{"Cosy-Key":["synthetic-caller-key-not-effective"]},"body_string":"x","body_bytes":"eA=="}`)},
 	}
 	hashes := map[string]string{}
 	for name, doc := range docs {

@@ -26,6 +26,7 @@ const (
 	defaultBase                 = "https://qoder.com"
 	refreshSkewSec              = 3600
 	defaultRefreshCommitTimeout = 30 * time.Second
+	credentialPersistRetryDelay = 30 * time.Second
 )
 
 type userInfo struct {
@@ -60,16 +61,17 @@ type authManager struct {
 	closeOnce sync.Once
 	closeErr  error
 
-	authFile        string
-	machineID       string
-	openapiBase     string
-	inferBase       string
-	webBase         string
-	httpc           *http.Client
-	ui              *userInfo
-	credentialDirty bool
-	commitTimeout   time.Duration
-	logf            func(string, ...any)
+	authFile                 string
+	machineID                string
+	openapiBase              string
+	inferBase                string
+	webBase                  string
+	httpc                    *http.Client
+	ui                       *userInfo
+	credentialDirty          bool
+	credentialPersistRetryAt time.Time
+	commitTimeout            time.Duration
+	logf                     func(string, ...any)
 }
 
 func newAuthManager(services *protocolServices, authDir, openapiBase, inferBase, webBase string, logf func(string, ...any)) (*authManager, error) {
@@ -273,7 +275,7 @@ func (a *authManager) load(ctx context.Context) error {
 		return err
 	}
 	a.ui = &ui
-	a.credentialDirty = false
+	a.clearCredentialDirtyLocked()
 	return a.rebuildContextLocked(ctx)
 }
 
@@ -367,6 +369,16 @@ func (a *authManager) stageCredentialForUserLocked(ctx context.Context, ui *user
 	return staged, nil
 }
 
+func (a *authManager) markCredentialDirtyLocked() {
+	a.credentialDirty = true
+	a.credentialPersistRetryAt = time.Time{}
+}
+
+func (a *authManager) clearCredentialDirtyLocked() {
+	a.credentialDirty = false
+	a.credentialPersistRetryAt = time.Time{}
+}
+
 func (a *authManager) saveLocked(ctx context.Context) error {
 	if err := a.closedStateError(); err != nil {
 		return err
@@ -374,7 +386,7 @@ func (a *authManager) saveLocked(ctx context.Context) error {
 	if a.ui == nil {
 		return nil
 	}
-	a.credentialDirty = true
+	a.markCredentialDirtyLocked()
 	staged, err := a.stageCredentialForUserLocked(ctx, a.ui)
 	if err != nil {
 		return err
@@ -383,7 +395,7 @@ func (a *authManager) saveLocked(ctx context.Context) error {
 	if err := staged.publish(); err != nil {
 		return err
 	}
-	a.credentialDirty = false
+	a.clearCredentialDirtyLocked()
 	return nil
 }
 
@@ -405,6 +417,20 @@ func (a *authManager) persistDirtyCredentialLocked(ctx context.Context) error {
 		return credentialPersistenceError("persist pending credentials", err)
 	}
 	return nil
+}
+
+func (a *authManager) persistDirtyCredentialBestEffortLocked(ctx context.Context, action string, force bool) {
+	if !a.credentialDirty {
+		return
+	}
+	now := time.Now()
+	if !force && !a.credentialPersistRetryAt.IsZero() && now.Before(a.credentialPersistRetryAt) {
+		return
+	}
+	if err := a.persistDirtyCredentialLocked(ctx); err != nil {
+		a.credentialPersistRetryAt = time.Now().Add(credentialPersistRetryDelay)
+		a.safeLogf("%s: %v", action, protocolDiagnosticError(err))
+	}
 }
 
 func (a *authManager) save(ctx context.Context) error {
@@ -499,7 +525,7 @@ func (a *authManager) buildContextForUserLocked(ctx context.Context, ui *userInf
 		}
 		ui.EncryptUserInfo, ui.Key = fields.EncryptUserInfo, fields.Key
 		if ui == a.ui {
-			a.credentialDirty = true
+			a.markCredentialDirtyLocked()
 		}
 	}
 	return a.protocol.contextFactory.New(ctx, a.contextConfigForLocked(ui))
@@ -560,7 +586,7 @@ func (a *authManager) commitLoginCandidateLocked(ctx context.Context, candidate 
 	old := a.protoCtx
 	a.protoCtx = next
 	a.ui = candidate
-	a.credentialDirty = false
+	a.clearCredentialDirtyLocked()
 	a.ctxMu.Unlock()
 
 	if old != nil {
@@ -580,9 +606,7 @@ func (a *authManager) ensureFresh(ctx context.Context) error {
 	if err := a.closedStateError(); err != nil {
 		return err
 	}
-	if err := a.persistDirtyCredentialLocked(ctx); err != nil {
-		return err
-	}
+	a.persistDirtyCredentialBestEffortLocked(ctx, "persist pending credentials", false)
 	if a.ui == nil {
 		return fmt.Errorf("not authenticated")
 	}
@@ -602,9 +626,7 @@ func (a *authManager) forceRefresh(ctx context.Context) error {
 	if err := a.closedStateError(); err != nil {
 		return err
 	}
-	if err := a.persistDirtyCredentialLocked(ctx); err != nil {
-		return err
-	}
+	a.persistDirtyCredentialBestEffortLocked(ctx, "persist pending credentials", false)
 	return a.refreshLocked(ctx)
 }
 
@@ -617,7 +639,7 @@ func (a *authManager) preserveRefreshRotationAndSaveLocked(ctx context.Context, 
 	if !refreshChanged && !expiryChanged {
 		return nil
 	}
-	a.credentialDirty = true
+	a.markCredentialDirtyLocked()
 	if refreshChanged {
 		a.ui.RefreshToken = refreshToken
 	}
@@ -699,11 +721,9 @@ func (a *authManager) refreshLocked(ctx context.Context) error {
 	if err := a.replaceContext(next); err != nil {
 		return mergeProtocolErrors(err, a.preserveRefreshRotationAndSaveLocked(commitCtx, r.RefreshToken, refreshExpiry))
 	}
-	a.credentialDirty = true
+	a.markCredentialDirtyLocked()
 	a.ui = candidate
-	if err := a.persistDirtyCredentialLocked(commitCtx); err != nil {
-		return err
-	}
+	a.persistDirtyCredentialBestEffortLocked(commitCtx, "persist refreshed credentials", true)
 	a.safeLogf("device token refreshed, new expiry %d", a.ui.ExpireTime)
 	return nil
 }
@@ -904,7 +924,7 @@ func (a *authManager) fetchUserInfo(ctx context.Context, target *userInfo) {
 	if a.closedStateError() != nil || a.ui != target {
 		return
 	}
-	a.credentialDirty = true
+	a.markCredentialDirtyLocked()
 	applyAuthUserInfoProfile(target, profile)
 	_ = a.rebuildContextLocked(ctx)
 	_ = a.saveLocked(ctx)

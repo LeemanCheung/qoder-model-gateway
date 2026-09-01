@@ -1119,6 +1119,70 @@ func TestAuthManagerRefreshPersistenceGetsFreshBudgetAfterBuildDeadline(t *testi
 	})
 }
 
+func TestAuthManagerDirtyCredentialPersistenceIsBestEffortAndRateLimited(t *testing.T) {
+	saveErr := errors.New("synthetic credential persistence failure")
+	codec := &fakeCredentialCodec{encryptErr: saveErr}
+	var logs strings.Builder
+	manager := &authManager{
+		protocol:  &protocolServices{credentials: codec},
+		authFile:  filepath.Join(t.TempDir(), "user"),
+		machineID: "synthetic-machine",
+		ui: &userInfo{
+			UID:                "synthetic-user",
+			SecurityOAuthToken: "synthetic-token",
+			ExpireTime:         time.Now().Add(2 * time.Hour).Unix(),
+		},
+		credentialDirty: true,
+		protoCtx:        &fakeProtocolContext{prepared: &preparedRequest{URL: "https://prepared.example.test"}},
+		logf: func(format string, args ...any) {
+			fmt.Fprintf(&logs, format+"\n", args...)
+		},
+	}
+	t.Cleanup(func() { _ = manager.Close() })
+
+	prepared, err := manager.PrepareInferRequest(context.Background(), inferRequestInput{})
+	if err != nil || prepared == nil || prepared.URL != "https://prepared.example.test" {
+		t.Fatalf("first PrepareInferRequest() = (%#v, %v), want admitted request", prepared, err)
+	}
+	manager.mu.Lock()
+	firstRetryAt := manager.credentialPersistRetryAt
+	firstDirty := manager.credentialDirty
+	manager.mu.Unlock()
+	if !firstDirty || !firstRetryAt.After(time.Now()) {
+		t.Fatalf("dirty/retry state = %v/%v, want dirty with future retry", firstDirty, firstRetryAt)
+	}
+	if !strings.Contains(logs.String(), "persist pending credentials") || !strings.Contains(logs.String(), saveErr.Error()) {
+		t.Fatalf("persistence diagnostic = %q", logs.String())
+	}
+
+	prepared, err = manager.PrepareInferRequest(context.Background(), inferRequestInput{})
+	if err != nil || prepared == nil {
+		t.Fatalf("second PrepareInferRequest() = (%#v, %v), want admitted request", prepared, err)
+	}
+	codec.mu.Lock()
+	callsBeforeDeadline := codec.encryptCalls
+	codec.encryptErr = nil
+	codec.mu.Unlock()
+	if callsBeforeDeadline != 1 {
+		t.Fatalf("Encrypt() calls before deadline = %d, want 1", callsBeforeDeadline)
+	}
+
+	manager.mu.Lock()
+	manager.credentialPersistRetryAt = time.Now().Add(-time.Second)
+	manager.mu.Unlock()
+	prepared, err = manager.PrepareInferRequest(context.Background(), inferRequestInput{})
+	if err != nil || prepared == nil {
+		t.Fatalf("retry PrepareInferRequest() = (%#v, %v)", prepared, err)
+	}
+	manager.mu.Lock()
+	finalDirty := manager.credentialDirty
+	finalRetryAt := manager.credentialPersistRetryAt
+	manager.mu.Unlock()
+	if finalDirty || !finalRetryAt.IsZero() {
+		t.Fatalf("final dirty/retry state = %v/%v, want clear", finalDirty, finalRetryAt)
+	}
+}
+
 func TestAuthManagerAcceptedRefreshRetriesDirtyCredentialWithoutRefetch(t *testing.T) {
 	const rotatedSecret = "synthetic-accepted-rotated-refresh"
 	var refreshCalls atomic.Int32
@@ -1156,22 +1220,17 @@ func TestAuthManagerAcceptedRefreshRetriesDirtyCredentialWithoutRefetch(t *testi
 	a.protoCtx = oldCtx
 
 	prepared, firstErr := a.PrepareInferRequest(context.Background(), inferRequestInput{})
-	if prepared != nil {
-		t.Fatalf("first prepared request = %#v, want nil while refreshed credential is dirty", prepared)
-	}
-	if protocolErrorKindOf(firstErr) != protocolAuthUnavailable || !errors.Is(protocolInternalError(firstErr), saveErr) {
-		t.Fatalf("first PrepareInferRequest() error = %v (internal: %v), want wrapped save failure", firstErr, protocolInternalError(firstErr))
-	}
-	if strings.Contains(firstErr.Error(), rotatedSecret) || strings.Contains(fmt.Sprint(protocolInternalError(firstErr)), rotatedSecret) {
-		t.Fatalf("first refresh save error leaked rotated token: public=%q internal=%q", firstErr, protocolInternalError(firstErr))
+	if firstErr != nil || prepared == nil || prepared.URL != "https://accepted.example.test" {
+		t.Fatalf("first PrepareInferRequest() = (%#v, %v), want accepted in-memory context", prepared, firstErr)
 	}
 	a.mu.Lock()
 	firstDirty := a.credentialDirty
+	firstRetryAt := a.credentialPersistRetryAt
 	firstToken := a.ui.SecurityOAuthToken
 	firstRefresh := a.ui.RefreshToken
 	a.mu.Unlock()
-	if !firstDirty {
-		t.Fatal("credentialDirty = false after accepted candidate save failure, want true")
+	if !firstDirty || !firstRetryAt.After(time.Now()) {
+		t.Fatalf("dirty/retry state = %v/%v, want dirty with future retry", firstDirty, firstRetryAt)
 	}
 	if firstToken != "synthetic-accepted-token" || firstRefresh != rotatedSecret {
 		t.Fatalf("accepted in-memory state = token %q refresh %q, want accepted candidate", firstToken, firstRefresh)
@@ -1184,23 +1243,36 @@ func TestAuthManagerAcceptedRefreshRetriesDirtyCredentialWithoutRefetch(t *testi
 	}
 
 	prepared, err = a.PrepareInferRequest(context.Background(), inferRequestInput{})
-	if err != nil {
-		t.Fatalf("second PrepareInferRequest() error = %v (internal: %v)", err, protocolInternalError(err))
+	if err != nil || prepared == nil || prepared.URL != "https://accepted.example.test" {
+		t.Fatalf("second PrepareInferRequest() = (%#v, %v), want accepted context", prepared, err)
 	}
-	if prepared.URL != "https://accepted.example.test" {
-		t.Fatalf("second prepared URL = %q, want accepted context", prepared.URL)
+	if codec.encryptCalls != 1 {
+		t.Fatalf("credential Encrypt() calls before retry deadline = %d, want 1", codec.encryptCalls)
+	}
+	a.mu.Lock()
+	if !a.credentialDirty {
+		a.mu.Unlock()
+		t.Fatal("credentialDirty = false before retry deadline")
+	}
+	a.credentialPersistRetryAt = time.Now().Add(-time.Second)
+	a.mu.Unlock()
+
+	prepared, err = a.PrepareInferRequest(context.Background(), inferRequestInput{})
+	if err != nil || prepared == nil || prepared.URL != "https://accepted.example.test" {
+		t.Fatalf("retry PrepareInferRequest() = (%#v, %v)", prepared, err)
 	}
 	if got := refreshCalls.Load(); got != 1 {
 		t.Fatalf("refresh HTTP calls = %d, want 1", got)
 	}
 	a.mu.Lock()
 	secondDirty := a.credentialDirty
+	secondRetryAt := a.credentialPersistRetryAt
 	a.mu.Unlock()
-	if secondDirty {
-		t.Fatal("credentialDirty = true after retry save, want false")
+	if secondDirty || !secondRetryAt.IsZero() {
+		t.Fatalf("dirty/retry state after save = %v/%v, want clear", secondDirty, secondRetryAt)
 	}
 	if codec.encryptCalls != 2 {
-		t.Fatalf("credential Encrypt() calls = %d, want failed save plus retry", codec.encryptCalls)
+		t.Fatalf("credential Encrypt() calls = %d, want failed save plus delayed retry", codec.encryptCalls)
 	}
 
 	if err := a.Close(); err != nil {
@@ -1266,30 +1338,30 @@ func TestAuthManagerPersistentDirtyCredentialFailureIsVisibleAndCloseReportsIt(t
 		},
 	}
 
-	firstErr := a.forceRefresh(context.Background())
-	if protocolErrorKindOf(firstErr) != protocolBackendFailure || !errors.Is(protocolInternalError(firstErr), saveErr) {
-		t.Fatalf("forceRefresh() error = %v (internal: %v), want safe backend save failure", firstErr, protocolInternalError(firstErr))
-	}
-	if strings.Contains(firstErr.Error(), rotatedSecret) || strings.Contains(fmt.Sprint(protocolInternalError(firstErr)), rotatedSecret) {
-		t.Fatalf("forceRefresh error leaked rotated token: public=%q internal=%q", firstErr, protocolInternalError(firstErr))
+	if err := a.forceRefresh(context.Background()); err != nil {
+		t.Fatalf("forceRefresh() error = %v, want accepted in-memory state", err)
 	}
 	a.mu.Lock()
 	dirtyAfterRefresh := a.credentialDirty
+	retryAtAfterRefresh := a.credentialPersistRetryAt
 	acceptedToken := a.ui.SecurityOAuthToken
 	a.mu.Unlock()
-	if !dirtyAfterRefresh || acceptedToken != "synthetic-persistent-token" {
-		t.Fatalf("accepted state after save failure = dirty %v token %q, want dirty accepted candidate", dirtyAfterRefresh, acceptedToken)
+	if !dirtyAfterRefresh || !retryAtAfterRefresh.After(time.Now()) || acceptedToken != "synthetic-persistent-token" {
+		t.Fatalf("accepted state after save failure = dirty %v retry %v token %q", dirtyAfterRefresh, retryAtAfterRefresh, acceptedToken)
 	}
 	if closes, _ := oldCtx.state(); closes != 1 {
 		t.Fatalf("old context Close() count = %d, want 1", closes)
 	}
 
 	prepared, retryErr := a.PrepareInferRequest(context.Background(), inferRequestInput{})
-	if prepared != nil || protocolErrorKindOf(retryErr) != protocolAuthUnavailable || !errors.Is(protocolInternalError(retryErr), saveErr) {
-		t.Fatalf("dirty retry PrepareInferRequest() = (%#v, %v), want visible persistence failure", prepared, retryErr)
+	if retryErr != nil || prepared == nil || prepared.URL != "https://persistent.example.test" {
+		t.Fatalf("dirty retry PrepareInferRequest() = (%#v, %v), want admitted request", prepared, retryErr)
 	}
 	if got := refreshCalls.Load(); got != 1 {
 		t.Fatalf("refresh HTTP calls after dirty retry = %d, want 1", got)
+	}
+	if codec.encryptCalls != 1 {
+		t.Fatalf("credential Encrypt() calls before retry deadline = %d, want 1", codec.encryptCalls)
 	}
 
 	closeErr := a.Close()
@@ -1302,8 +1374,8 @@ func TestAuthManagerPersistentDirtyCredentialFailureIsVisibleAndCloseReportsIt(t
 	if closes, _ := acceptedCtx.state(); closes != 1 {
 		t.Fatalf("accepted context Close() count = %d, want 1", closes)
 	}
-	if codec.encryptCalls != 3 {
-		t.Fatalf("credential Encrypt() calls = %d, want refresh, retry, and Close attempts", codec.encryptCalls)
+	if codec.encryptCalls != 2 {
+		t.Fatalf("credential Encrypt() calls = %d, want refresh and forced Close attempts", codec.encryptCalls)
 	}
 }
 

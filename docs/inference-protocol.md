@@ -67,9 +67,9 @@ presence matrix 已由独立 WASM characterization 和 native/WASM differential 
 
 外部 v1.1.34 oracle characterization 固定了 context 生命周期的 host 调用分界，production native implementation 与 frozen fixtures 保持该语义：
 
-- `nativeContextFactory.New` 的 redraw-free 基础形状为 `[16,109]`，不读取时钟：16 bytes 用于 runtime UUID，109 bytes 用于 RSA PKCS#1 v1.5 PS。PS 中每遇到一个 zero byte，就按从左到右顺序追加一次或多次 1-byte 重抽，直到该位置非零；因此含 zero 的有效形状可以是 `[16,109,1,...]`。New **保留调用方传入的 `encrypt_user_info` 与 `key`**；生成 runtime fields 只复现 oracle 的 entropy 行为，不替换持久化字段。
+- `nativeContextFactory.New` 的 redraw-free 基础形状为 `[16,109]`，不读取时钟：16 bytes 用于 runtime UUID，109 bytes 用于 RSA PKCS#1 v1.5 PS。PS 中每遇到一个 zero byte，就按从左到右顺序追加一次或多次 1-byte 重抽，直到该位置非零；因此含 zero 的有效形状可以是 `[16,109,1,...]`。使用与生成结果明确不同的 synthetic caller fields 对 pinned WASM 做 full-org 与 no-org 探针后，两者都证明 New **保留调用方传入的 `encrypt_user_info` 与 `key`**，Prepare 的 payload `info` 与 `Cosy-Key` 直接读取 caller fields。New 内部 runtime-field 生成的结果不进入签名状态；native 仍执行该生成并传播其 entropy/error/cancellation 行为，作为 oracle-observed constructor side effect。
 - 随后的每次 `PrepareInferRequest` 精确读取一次时钟和一段 16-byte 安全熵，global host-call order 为 **clock → entropy**。该 16-byte tape 用于本节下方的 COSY request UUID；时钟用于 `Cosy-Date` 与签名。
-- 测试分别 replay New 与 Prepare 并检查 transcript exhaustion；另有含 zero 的 New tape 固化 1-byte redraw 顺序。`infer-user.json` 为兼容历史 fixture 仍保存 redraw-free 组合形状 `[16,109,16]` 加一次时钟。
+- 测试分别 replay New 与 Prepare 并检查 transcript exhaustion；另有含 zero 的 New tape 固化 1-byte redraw 顺序。`infer-user.json` 保留完整 22-header 历史向量；`infer-user-no-org.json` 使用不同 caller fields 固化 caller ownership、no-org/empty-tags 与 empty-model-key 的 18-header 行为。两份 fixture 都保存 redraw-free 组合形状 `[16,109,16]` 加一次时钟。
 
 ### 3.1 request UUID
 
@@ -193,11 +193,11 @@ Production 只有一个 native service constructor；没有 backend mode flag、
 native context 的当前语义如下：
 
 - Factory 校验完整的 clock/entropy，以及 machine ID、版本、UID、非 nil organization tags 和四个非空 scene 字段；organization ID 与非 nil tags slice 可为空。配置和 tags 在 New 边界深拷贝。nil tags 按 frozen oracle 行为在任何 runtime/host work 前拒绝。
-- New 使用调用 context 中的 host override（存在时优先于 factory host）执行 redraw-free `[16,109]`、零 clock 的 runtime-field 初始化；PS 中出现 zero 时追加 1-byte redraw。它保留调用方已有的两个 runtime fields，生成结果不替换持久化字段。
+- New 使用调用 context 中的 host override（存在时优先于 factory host）执行 redraw-free `[16,109]`、零 clock 的 runtime-field 初始化；PS 中出现 zero 时追加 1-byte redraw。pinned WASM 的 full-org/no-org 非退化探针都确认生成结果不进入 context signing state：context 保留 caller fields，Prepare 的 payload `info` 与 `Cosy-Key` 也使用 caller fields。该生成调用保留的是 constructor side effect、失败与取消语义，不是字段替换。
 - `PrepareInferRequest` 在本地构造完整 COSY request：literal endpoint concatenation、native body codec、反转/mask request UUID、固定顺序 payload、standard padded Base64、canonical MD5、条件 header presence，以及 fresh URL/header/body ownership。每次 prepare 按 **clock → 16-byte entropy** 顺序各调用一次；没有隐藏 counter 或 transcript state。
 - context 本身不保存 transcript 或隐藏计数器。每次 Prepare 获得独立的不可变状态副本和 body 副本，返回的 header map、header value slices 与 body 也拥有独立 storage。生产 wall clock 与 secure entropy 实现可并发使用；record/replay machinery 仅存在于测试文件。
 - Close 幂等并等待在途 Prepare；关闭开始后不再接纳新 Prepare。该本地 context 边界不执行 auth refresh 或网络请求。
 
-普通 root 测试使用 frozen fixtures 和 native deterministic replay，不需要 Python、外部 WASM 或网络。离线证据包括：`infer-user.json` 的 byte-for-byte native match、15 个 pinned lowercase signature vectors、header presence matrix、覆盖 body/model/organization/policy/time/endpoint 变化的 deterministic corpus、native retry regeneration、race/fuzz/stress 和跨平台构建。
+普通 root 测试使用 frozen fixtures 和 native deterministic replay，不需要 Python、外部 WASM 或网络。离线证据包括：`infer-user.json` 的完整 22-header byte-for-byte match、`infer-user-no-org.json` 的 caller-field ownership 与 18-header match、15 个 pinned lowercase signature vectors、header presence matrix、覆盖 body/model/organization/policy/time/endpoint 变化的 deterministic corpus、native retry regeneration、race/fuzz/stress 和跨平台构建。external oracle 会按 `credential`、`runtime`、`model-cache`、`infer`、`infer-no-org` 顺序复核五个文档。
 
 可选 external oracle 位于 `tools/wasm_oracle` 独立子模块中，保留其自己的 wazero 依赖。它只接受运维方显式提供且身份匹配的授权 WASM，并以内容静默方式复核 synthetic frozen fixtures；它不属于 production dependency graph。

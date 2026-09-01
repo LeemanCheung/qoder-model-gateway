@@ -53,6 +53,8 @@ const (
 	protocolFixtureCredentialPlain = `{"uid":"synthetic-user-0001","organization_id":"synthetic-org-0001","access_token":"synthetic-access-token-0001"}`
 	protocolFixtureModelCachePlain = `{"models":[{"id":"synthetic-model-0001"}]}`
 	protocolFixtureRuntimeInput    = `{"uid":"synthetic-user-0001","organization_id":"synthetic-org-0001","organization_tags":["synthetic-a","b"],"data_policy_agreed":true}`
+	protocolFixtureNoOrgCallerInfo = "synthetic-caller-info-not-effective"
+	protocolFixtureNoOrgCallerKey  = "synthetic-caller-key-not-effective"
 	protocolFixtureOracleSize      = 297238
 	protocolFixtureOracleSHA256    = "b3ddd7c9235cea51a965582506fa6281bb298ddab782ff3edb3f9015da2468d4"
 )
@@ -60,7 +62,7 @@ const (
 var (
 	protocolFixtureTags     = []string{"synthetic-a", "b"}
 	protocolFixtureIdentity = fixtureOracle{Version: "1.1.34", Size: protocolFixtureOracleSize, SHA256: protocolFixtureOracleSHA256}
-	protocolFixtureNames    = []string{"runtime-fields.json", "credential.json", "model-cache.json", "infer-user.json"}
+	protocolFixtureNames    = []string{"runtime-fields.json", "credential.json", "model-cache.json", "infer-user.json", "infer-user-no-org.json"}
 )
 
 type fixtureClock struct{}
@@ -205,7 +207,7 @@ func replayNativeProtocolFixture(t *testing.T, name string, fixture protocolFixt
 			t.Fatalf("native model-cache fixture decrypt mismatch: error kind %q", protocolErrorKindOf(err))
 		}
 		assertReplayExhausted(t, replay)
-	case "infer-user.json":
+	case "infer-user.json", "infer-user-no-org.json":
 		replayNativeInferFixture(t, fixture)
 	default:
 		t.Fatalf("unknown protocol fixture %q", name)
@@ -428,6 +430,47 @@ func validateProtocolFixture(t *testing.T, name string, fixture protocolFixture)
 		assertEntropyShape(t, fixture.Transcript, 16, 109, 16)
 		if !reflect.DeepEqual(fixture.Transcript.UnixMilli, []int64{protocolFixtureUnixMilli}) {
 			t.Fatal("infer fixture clock transcript mismatch")
+		}
+	case "infer-user-no-org.json":
+		var input inferFixtureInput
+		decodeExactJSON(t, fixture.Input, &input)
+		wantUser := protocolUserInfo{
+			UID:              protocolFixtureUID,
+			EncryptUserInfo:  protocolFixtureNoOrgCallerInfo,
+			Key:              protocolFixtureNoOrgCallerKey,
+			OrganizationID:   "",
+			OrganizationTags: []string{},
+			DataPolicyAgreed: false,
+		}
+		if input.MachineID != protocolFixtureMachineID || input.Version != qoderProtocolVersion ||
+			!reflect.DeepEqual(input.User, wantUser) || !reflect.DeepEqual(input.Scene, defaultProtocolScene()) ||
+			input.Endpoint != protocolFixtureEndpoint || input.BodyRaw != deterministicFixtureRemoteChatAskBody(t) ||
+			input.ModelKey != "" || input.ModelSource != "system" {
+			t.Fatal("no-org infer fixture input is outside the synthetic allowlist")
+		}
+		var expected inferFixtureExpected
+		decodeExactJSON(t, fixture.Expected, &expected)
+		if expected.URL == "" || len(expected.Header) != 18 || expected.BodyString != string(expected.BodyBytes) {
+			t.Fatal("no-org infer expected output is incomplete")
+		}
+		if expected.Header.Get("Cosy-Data-Policy") != "disagree" {
+			t.Fatal("no-org infer fixture data policy header mismatch")
+		}
+		for _, header := range []string{"Cosy-Organization-Id", "Cosy-Organization-Tags", "X-Model-Key", "X-Model-Source"} {
+			if _, present := expected.Header[http.CanonicalHeaderKey(header)]; present {
+				t.Fatalf("no-org infer fixture unexpectedly contains %s", header)
+			}
+		}
+		payload, _ := nativeInferAuthorizationForTest(t, expected.Header)
+		if payload.Info != input.User.EncryptUserInfo {
+			t.Fatal("no-org infer fixture payload info did not preserve caller input")
+		}
+		if key := expected.Header.Get("Cosy-Key"); key != input.User.Key {
+			t.Fatal("no-org infer fixture Cosy-Key did not preserve caller input")
+		}
+		assertEntropyShape(t, fixture.Transcript, 16, 109, 16)
+		if !reflect.DeepEqual(fixture.Transcript.UnixMilli, []int64{protocolFixtureUnixMilli}) {
+			t.Fatal("no-org infer fixture clock transcript mismatch")
 		}
 	default:
 		t.Fatalf("unknown fixture %q", name)

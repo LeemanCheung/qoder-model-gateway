@@ -23,13 +23,14 @@ const (
 )
 
 var (
-	fixtureNames         = []string{"credential.json", "runtime-fields.json", "model-cache.json", "infer-user.json"}
-	fixtureJSONNames     = []string{"credential.json", "infer-user.json", "manifest.json", "model-cache.json", "runtime-fields.json"}
+	fixtureNames         = []string{"credential.json", "runtime-fields.json", "model-cache.json", "infer-user.json", "infer-user-no-org.json"}
+	fixtureJSONNames     = []string{"credential.json", "infer-user-no-org.json", "infer-user.json", "manifest.json", "model-cache.json", "runtime-fields.json"}
 	pinnedDocumentHashes = map[string]string{
-		"credential.json":     "07b80f1d48141d763dab7065465b0bd531ae8e490f56a1999322b2faa1d29574",
-		"infer-user.json":     "9732d0ca933bcf53e2e26e09b0e6a8ec46bd310ce925a8c2b74f24ab6f9b99ed",
-		"model-cache.json":    "7c9dd168e83f6461b1826aae6b475c6ed419f5b9f45b4bfbecfbfd9617407cc8",
-		"runtime-fields.json": "9ab327de55b7ece6d429783152b77298c3b0eb1a51776213741ba8784954aaf0",
+		"credential.json":        "07b80f1d48141d763dab7065465b0bd531ae8e490f56a1999322b2faa1d29574",
+		"infer-user-no-org.json": "1f7d66201ff1b3d25890cd4399d2aca67b582d938d715f2f0fb048a62e0e78d6",
+		"infer-user.json":        "9732d0ca933bcf53e2e26e09b0e6a8ec46bd310ce925a8c2b74f24ab6f9b99ed",
+		"model-cache.json":       "7c9dd168e83f6461b1826aae6b475c6ed419f5b9f45b4bfbecfbfd9617407cc8",
+		"runtime-fields.json":    "9ab327de55b7ece6d429783152b77298c3b0eb1a51776213741ba8784954aaf0",
 	}
 )
 

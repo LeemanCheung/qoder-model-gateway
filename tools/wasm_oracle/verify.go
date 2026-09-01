@@ -119,29 +119,45 @@ func verifyFixtures(ctx context.Context, source []byte, fixtures fixtureSet, out
 		return backend.accounting, fail("model-cache-output")
 	}
 	emitStatus(out, statusLine{"model-cache", transcriptShape(modelTranscript), "PASS", ""})
-	infer, err := mustDecode[inferInput](fixtures["infer-user.json"].Input)
-	if err != nil {
+	if err := verifyInferFixture(ctx, backend, fixtures["infer-user.json"], "infer", out); err != nil {
 		return backend.accounting, err
 	}
-	inferWant, _ := mustDecode[inferExpected](fixtures["infer-user.json"].Expected)
+	if err := verifyInferFixture(ctx, backend, fixtures["infer-user-no-org.json"], "infer-no-org", out); err != nil {
+		return backend.accounting, err
+	}
+	if backend.accounting.ResultStrings != 9 || backend.accounting.Contexts != 2 || backend.accounting.RequestResults != 2 {
+		return backend.accounting, fail("free-accounting")
+	}
+	return backend.accounting, nil
+}
+
+func verifyInferFixture(ctx context.Context, backend *wasmBackend, fixture fixtureDocument, operation string, out io.Writer) error {
+	infer, err := mustDecode[inferInput](fixture.Input)
+	if err != nil {
+		return err
+	}
+	inferWant, err := mustDecode[inferExpected](fixture.Expected)
+	if err != nil {
+		return err
+	}
 	userJSON, err := compactJSON(infer.User)
 	if err != nil {
-		return backend.accounting, err
+		return err
 	}
 	sceneJSON, err := compactJSON(infer.Scene)
 	if err != nil {
-		return backend.accounting, err
+		return err
 	}
-	inferTranscript := fixtures["infer-user.json"].Transcript
+	inferTranscript := fixture.Transcript
 	if len(inferTranscript.EntropyReads) != 3 || len(inferTranscript.UnixMilli) != 1 {
-		return backend.accounting, fail("infer-transcript-shape")
+		return fail("infer-transcript-shape")
 	}
 	calls := []hostCall{{Kind: hostEntropy, Length: inferTranscript.EntropyReads[0].Length}, {Kind: hostEntropy, Length: inferTranscript.EntropyReads[1].Length}, {Kind: hostClock}, {Kind: hostEntropy, Length: inferTranscript.EntropyReads[2].Length}}
-	replay = newOrderedReplay(inferTranscript, calls)
+	replay := newOrderedReplay(inferTranscript, calls)
 	backend.setReplay(replay)
 	contextPtr, err := backend.newContext(ctx, infer.MachineID, infer.Version, userJSON, sceneJSON)
 	if err != nil {
-		return backend.accounting, err
+		return err
 	}
 	defer func() {
 		if contextPtr != 0 {
@@ -150,24 +166,21 @@ func verifyFixtures(ctx context.Context, source []byte, fixtures fixtureSet, out
 	}()
 	prepared, err := backend.prepareInfer(ctx, contextPtr, infer.Endpoint, infer.BodyRaw, infer.ModelKey, infer.ModelSource)
 	if err != nil {
-		return backend.accounting, err
+		return err
 	}
 	if err = replay.Exhausted(); err != nil {
-		return backend.accounting, err
+		return err
 	}
 	if prepared.URL != inferWant.URL || prepared.Body != inferWant.BodyString || !equalHeaders(prepared.Headers, inferWant.Header) {
-		return backend.accounting, fail("infer-output")
+		return fail("infer-output")
 	}
 	if err := backend.freeContext(ctx, contextPtr); err != nil {
-		return backend.accounting, err
+		return err
 	}
 	contextPtr = 0
-	if backend.accounting.ResultStrings != 7 || backend.accounting.Contexts != 1 || backend.accounting.RequestResults != 1 {
-		return backend.accounting, fail("free-accounting")
-	}
 	shape := fmt.Sprintf("new[clock:0,entropy:%d,%d],prepare[clock:1,entropy:%d]", inferTranscript.EntropyReads[0].Length, inferTranscript.EntropyReads[1].Length, inferTranscript.EntropyReads[2].Length)
-	emitStatus(out, statusLine{"infer", shape, "PASS", ""})
-	return backend.accounting, nil
+	emitStatus(out, statusLine{operation, shape, "PASS", ""})
+	return nil
 }
 func equalHeaders(actual map[string]string, expected map[string][]string) bool {
 	if len(actual) != len(expected) {
