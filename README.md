@@ -357,7 +357,7 @@ WASM 导出（wasm-bindgen ABI）：`qodercontext_new` / `qodercontext_prepareIn
 
 Production 无需 backend mode：启动只构造 native services；源码、root module 和生产 binary 中没有 WASM runtime、embedded oracle 或 wazero。普通 root tests 只使用 frozen synthetic fixtures 和 native replay；可选 external oracle 独立位于 `tools/`。
 
-迁移前已完成 shadow/native/rollback parity gates；移除后重新执行 native 全矩阵、refresh/context rebuild、完整测试、race、vet、Windows cross-compile、10,000-operation stress、四个 fuzz target、五项 benchmark，以及 dependency/binary-content audit。benchmark 只作为性能证据，不设绝对 pass/fail 阈值。
+迁移前已完成 shadow/native/rollback parity gates；移除后重新执行 native 全矩阵、refresh/context rebuild、完整测试、race、vet、Windows cross-compile、10,000-operation stress、四个 fuzz target、五项 benchmark，以及 dependency/binary-content audit。benchmark 只作为性能证据，不设绝对 pass/fail 阈值。完整 Native vs WASM 快照、方法与复跑说明见 [BENCHMARK.md](BENCHMARK.md)。
 
 E2E 直接使用当前机器已授权的生产凭证目录、加密模型缓存和默认生产端点；也可用 `QODER2API_E2E_AUTH_DIR`、`QODER2API_E2E_INFER_ENDPOINT`、`QODER2API_E2E_OPENAPI_ENDPOINT`、`QODER2API_E2E_WEB_ENDPOINT` 做内容静默的受控覆盖。harness 强制关闭 dump-dir，输出只含 `backend=native`、route、stream、HTTP/schema 成功状态、时长与安全 upstream shape。普通 native gate 对真实凭证只读；只有同时设置 `QODER2API_E2E=1` 与 `QODER2API_E2E_REFRESH=1` 的 refresh gate 才允许轮换并持久化真实授权 token。
 
@@ -374,6 +374,9 @@ go test . -run '^TestNative(RuntimeFields|Prepare|ContextRebuild|RepeatedClose)S
 
 # 仅报告 Go 标准 benchmark/alloc 指标，不设置任意性能阈值。
 go test . -run '^$' -bench '^BenchmarkNative(Body|Credential|Runtime|ModelCache|Infer)$' -benchmem -count=1
+
+# 使用经授权的外部 pinned WASM 复跑 Native vs WASM 对比并更新 BENCHMARK.md。
+python3 tools/benchmark.py --wasm /authorized/path/qoder_auth.wasm
 
 # 仅交叉编译 Windows amd64 测试二进制，不在当前主机执行；临时产物自动删除。
 windows_test_bin="$(mktemp)"

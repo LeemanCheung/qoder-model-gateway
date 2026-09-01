@@ -65,6 +65,28 @@ GOWORK=off GOPROXY=off go -C tools/wasm_oracle test -run TestAuthorizedWASMFixtu
 
 Use synthetic repository fixtures only. Do not supply real credentials, captures, tokens, request bodies, or user data to this tool. It performs no network requests.
 
+## Benchmark Native against the external oracle
+
+Run the reproducible Native-vs-WASM comparison from the repository root:
+
+```bash
+python3 tools/benchmark.py --wasm /authorized/path/qoder_auth.wasm
+```
+
+The runner verifies the pinned WASM size/SHA, uses only the repository's frozen synthetic fixtures, runs Native and WASM sequentially with `GOMAXPROCS=1`, and atomically writes [`BENCHMARK.md`](../BENCHMARK.md) only after both suites succeed. It performs no network requests and does not print or persist the external WASM path.
+
+Defaults are ten one-second samples per benchmark. For a shorter diagnostic run:
+
+```bash
+python3 tools/benchmark.py \
+  --wasm /authorized/path/qoder_auth.wasm \
+  --count 1 \
+  --benchtime 10x \
+  --output /tmp/qoder-benchmark-smoke.md
+```
+
+Use `--count` and `--benchtime` only to change sampling depth; the benchmark operations, fixtures, single-CPU execution, and Native/WASM ordering stay fixed.
+
 ## Redistribution and licensing
 
 Only use a WASM binary that you are authorized to possess and execute. Do not copy or redistribute it without confirming the applicable license and permissions. Production is native-only and the root module has no WASM or wazero dependency; this independent tool workflow always requires an external operator-supplied binary.
