@@ -1,0 +1,11 @@
+{
+  "version": "1.1.34",
+  "size": 297238,
+  "sha256": "b3ddd7c9235cea51a965582506fa6281bb298ddab782ff3edb3f9015da2468d4",
+  "documents": {
+    "credential.json": "07b80f1d48141d763dab7065465b0bd531ae8e490f56a1999322b2faa1d29574",
+    "infer-user.json": "9732d0ca933bcf53e2e26e09b0e6a8ec46bd310ce925a8c2b74f24ab6f9b99ed",
+    "model-cache.json": "7c9dd168e83f6461b1826aae6b475c6ed419f5b9f45b4bfbecfbfd9617407cc8",
+    "runtime-fields.json": "9ab327de55b7ece6d429783152b77298c3b0eb1a51776213741ba8784954aaf0"
+  }
+}

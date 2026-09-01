@@ -1,18 +1,161 @@
 #!/usr/bin/env python3
-"""Run the bundled qoder_auth_wasm module under wasmtime for local analysis."""
+"""Optional, external-path qoder_auth WASM oracle for synthetic frozen fixtures."""
 
 import argparse
+import base64
+import contextlib
+import hashlib
+import importlib.util
+import io
+import json
 import os
+import stat
 import struct
+import subprocess
 import sys
-import time
+import tempfile
 
-from wasmtime import Func, FuncType, Linker, Module, Store, ValType
-
+PINNED_WASM_SIZE = 297238
+PINNED_WASM_SHA256 = "b3ddd7c9235cea51a965582506fa6281bb298ddab782ff3edb3f9015da2468d4"
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEFAULT_WASM = os.path.join(REPO_ROOT, "assets", "qoder_auth_wasm_bg.wasm")
-I32 = ValType.i32()
-F64 = ValType.f64()
+DEFAULT_FIXTURES = os.path.join(REPO_ROOT, "testdata", "protocol", "1.1.34")
+FIXTURE_NAMES = ("runtime-fields.json", "credential.json", "model-cache.json", "infer-user.json")
+FIXTURE_JSON_NAMES = frozenset(FIXTURE_NAMES + ("manifest.json",))
+ORACLE_IDENTITY = {"version": "1.1.34", "size": PINNED_WASM_SIZE, "sha256": PINNED_WASM_SHA256}
+PINNED_FIXTURE_HASHES = {
+    "credential.json": "07b80f1d48141d763dab7065465b0bd531ae8e490f56a1999322b2faa1d29574",
+    "infer-user.json": "9732d0ca933bcf53e2e26e09b0e6a8ec46bd310ce925a8c2b74f24ab6f9b99ed",
+    "model-cache.json": "7c9dd168e83f6461b1826aae6b475c6ed419f5b9f45b4bfbecfbfd9617407cc8",
+    "runtime-fields.json": "9ab327de55b7ece6d429783152b77298c3b0eb1a51776213741ba8784954aaf0",
+}
+
+
+class HarnessError(Exception):
+    def __init__(self, category):
+        super().__init__(category)
+        self.category = category
+
+
+def decode_string_result(data):
+    if len(data) < 16:
+        raise HarnessError("abi-string-result-length")
+    return struct.unpack("<IIII", data[:16])
+
+
+def decode_object_result(data):
+    if len(data) < 12:
+        raise HarnessError("abi-object-result-length")
+    return struct.unpack("<III", data[:12])
+
+
+def validate_wasm_bytes(data, expected_size=PINNED_WASM_SIZE, expected_sha256=PINNED_WASM_SHA256):
+    if len(data) != expected_size:
+        raise HarnessError("wasm-identity-size")
+    if hashlib.sha256(data).hexdigest() != expected_sha256:
+        raise HarnessError("wasm-identity-sha256")
+
+
+def read_bounded_regular_file(path, maximum, category):
+    try:
+        metadata = os.stat(path, follow_symlinks=False)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > maximum:
+            raise HarnessError(category)
+        with open(path, "rb") as source:
+            data = source.read(maximum + 1)
+    except HarnessError:
+        raise
+    except OSError as error:
+        raise HarnessError(category) from error
+    if len(data) > maximum:
+        raise HarnessError(category)
+    return data
+
+
+def load_authorized_wasm(path):
+    data = read_bounded_regular_file(path, PINNED_WASM_SIZE, "wasm-read")
+    validate_wasm_bytes(data)
+    return data
+
+
+def safe_line(operation, transcript_shape, passed, category=None):
+    result = "PASS" if passed else "FAIL"
+    line = f"{operation} transcript={transcript_shape} result={result}"
+    if category:
+        line += f" category={category}"
+    return line
+
+
+def js_utf16_length(value):
+    if not isinstance(value, str):
+        return len(value)
+    try:
+        return len(value.encode("utf-16-le")) // 2
+    except UnicodeEncodeError as error:
+        raise HarnessError("unicode-invalid") from error
+
+
+class TranscriptReplay:
+    def __init__(self, unix_milli, entropy_reads, order):
+        self.unix_milli = list(unix_milli or [])
+        self.entropy_reads = [(length, bytes(data)) for length, data in entropy_reads]
+        self.order = list(order)
+        self.time_cursor = 0
+        self.entropy_cursor = 0
+        self.order_cursor = 0
+
+    @classmethod
+    def from_fixture(cls, transcript, order):
+        reads = []
+        for entry in transcript.get("entropy_reads") or []:
+            try:
+                data = base64.b64decode(entry["bytes"], validate=True)
+                length = int(entry["length"])
+            except (KeyError, TypeError, ValueError) as error:
+                raise HarnessError("transcript-schema") from error
+            if len(data) != length:
+                raise HarnessError("transcript-byte-count")
+            reads.append((length, data))
+        return cls(transcript.get("unix_milli") or [], reads, order)
+
+    def _expect(self, kind, length=None):
+        if self.order_cursor >= len(self.order):
+            raise HarnessError("transcript-order-exhausted")
+        expected = self.order[self.order_cursor]
+        actual = (kind, length) if length is not None else (kind,)
+        if expected != actual:
+            raise HarnessError("transcript-order")
+        self.order_cursor += 1
+
+    def read(self, length):
+        self._expect("entropy", length)
+        if self.entropy_cursor >= len(self.entropy_reads):
+            raise HarnessError("transcript-entropy-exhausted")
+        expected_length, data = self.entropy_reads[self.entropy_cursor]
+        self.entropy_cursor += 1
+        if expected_length != length:
+            raise HarnessError("transcript-entropy-length")
+        return data
+
+    def now(self):
+        self._expect("clock")
+        if self.time_cursor >= len(self.unix_milli):
+            raise HarnessError("transcript-clock-exhausted")
+        value = self.unix_milli[self.time_cursor]
+        self.time_cursor += 1
+        return float(value)
+
+    def exhausted(self):
+        if self.order_cursor != len(self.order):
+            raise HarnessError("transcript-order-unconsumed")
+        if self.time_cursor != len(self.unix_milli):
+            raise HarnessError("transcript-clock-unconsumed")
+        if self.entropy_cursor != len(self.entropy_reads):
+            raise HarnessError("transcript-entropy-unconsumed")
+
+    def shape(self):
+        lengths = ",".join(str(length) for length, _ in self.entropy_reads) or "none"
+        return f"clock:{len(self.unix_milli)},entropy:{lengths}"
+
 
 class FakeU8:
     def __init__(self, n_or_bytes, harness=None, ptr=None):
@@ -34,25 +177,41 @@ class FakeU8:
         return bytearray(self.buf)
 
     def write(self, data):
+        if len(data) != self.n:
+            raise HarnessError("host-array-length")
         if self.ptr is not None:
             self.harness.mem_write(self.ptr, bytes(data))
         else:
             self.buf[:] = data
 
+
 class FakeMap(dict):
     pass
 
+
 UNDEFINED = None
+
+
 class _Null:
-    def __repr__(self): return 'null'
+    pass
+
+
 NULL = _Null()
-GLOBAL = {'__global__': True}
-CRYPTO = {'__crypto__': True}
-PROCESS = {'__process__': True}
-VERSIONS = {'node': '24.3.0'}
+GLOBAL = {"__global__": True}
+CRYPTO = {"__crypto__": True}
+PROCESS = {"__process__": True}
+VERSIONS = {"node": "24.3.0"}
+
 
 class WasmBound:
-    def __init__(self, wasm_path=DEFAULT_WASM):
+    def __init__(self, wasm_bytes):
+        try:
+            from wasmtime import Func, FuncType, Linker, Module, Store, ValType
+        except ImportError as error:
+            raise HarnessError("dependency-wasmtime") from error
+        self.Func = Func
+        self.FuncType = FuncType
+        self.ValType = ValType
         self.store = Store()
         self.heap = [UNDEFINED] * 1024 + [UNDEFINED, NULL, True, False]
         self.heap_next = 1028
@@ -60,309 +219,660 @@ class WasmBound:
         self.crypto_idx = self._add(CRYPTO)
         self.process_idx = self._add(PROCESS)
         self.versions_idx = self._add(VERSIONS)
-        self.log_calls = os.environ.get('WASM_LOG') == '1'
-        engine = self.store.engine
-        with open(wasm_path, "rb") as wasm_file:
-            self.module = Module(engine, wasm_file.read())
-        self.linker = Linker(engine)
+        self.replay = None
+        self.module = Module(self.store.engine, wasm_bytes)
+        self.linker = Linker(self.store.engine)
         self._define_imports()
         self.instance = self.linker.instantiate(self.store, self.module)
-        ex = self.instance.exports(self.store)
-        self.mem = ex['memory']
-        self.malloc = ex['__wbindgen_export2']
-        self.realloc = ex['__wbindgen_export3']
-        self.free = ex['__wbindgen_export4']
-        self.ssp = ex['__wbindgen_add_to_stack_pointer']
-        self.ex = ex
+        self.ex = self.instance.exports(self.store)
+        self.mem = self.ex["memory"]
+        self.malloc = self.ex["__wbindgen_export2"]
+        self.free = self.ex["__wbindgen_export4"]
+        self.ssp = self.ex["__wbindgen_add_to_stack_pointer"]
 
-    # ---- heap ----
-    def _add(self, val):
+    def set_replay(self, replay):
+        self.replay = replay
+
+    def _entropy(self, length):
+        if self.replay is None:
+            raise HarnessError("transcript-missing")
+        return self.replay.read(length)
+
+    def _now(self):
+        if self.replay is None:
+            raise HarnessError("transcript-missing")
+        return self.replay.now()
+
+    def _add(self, value):
         if self.heap_next == len(self.heap):
             self.heap.append(len(self.heap) + 1)
-        h = self.heap_next
-        self.heap_next = self.heap[h] if h < len(self.heap) else len(self.heap)
+        index = self.heap_next
+        self.heap_next = self.heap[index] if index < len(self.heap) else len(self.heap)
         if not isinstance(self.heap_next, int):
             self.heap_next = len(self.heap)
-        while len(self.heap) <= h:
+        while len(self.heap) <= index:
             self.heap.append(UNDEFINED)
-        self.heap[h] = val
-        return h
+        self.heap[index] = value
+        return index
 
-    def _drop(self, i):
-        if i < 1028 or i >= len(self.heap):
+    def _drop(self, index):
+        if index < 1028 or index >= len(self.heap):
             return
-        self.heap[i] = self.heap_next
-        self.heap_next = i
+        self.heap[index] = self.heap_next
+        self.heap_next = index
 
-    def _get(self, i):
-        if 0 <= i < len(self.heap):
-            return self.heap[i]
-        if self.log_calls:
-            print(f'  [heap?] read unallocated idx {i} (len={len(self.heap)})', file=sys.stderr)
+    def _get(self, index):
+        if 0 <= index < len(self.heap):
+            return self.heap[index]
         return UNDEFINED
 
-    # ---- memory helpers ----
-    def mem_read(self, ptr, n):
-        return self.mem.read(self.store, ptr, ptr + n)
+    def _take(self, index):
+        value = self._get(index)
+        self._drop(index)
+        return value
+
+    def mem_read(self, ptr, length):
+        return self.mem.read(self.store, ptr, ptr + length)
 
     def mem_write(self, ptr, data):
         self.mem.write(self.store, data, ptr)
 
-    def read_str(self, ptr, n):
-        return bytes(self.mem_read(ptr, n)).decode('utf-8')
+    def read_str(self, ptr, length):
+        return bytes(self.mem_read(ptr, length)).decode("utf-8")
 
-    def pass_str(self, s):
-        b = s.encode('utf-8')
-        ptr = self.malloc(self.store, len(b), 1)
-        self.mem_write(ptr, b)
-        return ptr, len(b)
+    def pass_str(self, value):
+        data = value.encode("utf-8")
+        ptr = self.malloc(self.store, len(data), 1)
+        self.mem_write(ptr, data)
+        return ptr, len(data)
 
-    def ret_str(self, retptr):
-        data = self.mem_read(retptr, 8)
-        ptr, ln = struct.unpack('<II', data)
-        s = self.read_str(ptr, ln)
-        self.free(self.store, ptr, ln, 1)
-        return s
-
-    # ---- imports ----
-    def _define_imports(self):
-        L = self.linker
-        S = self.store
-        mod = './qoder_auth_wasm_bg.js'
-
-        def deff(name, params, results, fn):
-            t = FuncType(params, results)
-            L.define(S, mod, name, Func(S, t, fn))
-
-        def log(*a):
-            if self.log_calls:
-                print('  [import]', *a, file=sys.stderr)
-
-        deff('__wbindgen_object_drop_ref', [I32], [], lambda i: self._drop(i))
-
-        def map_set(m, k, v):
-            mv = self._get(m)
-            log('map.set on', m, type(mv).__name__, self._get(k), self._get(v))
-            if isinstance(mv, (FakeMap, dict)):
-                mv[self._get(k)] = self._get(v)
-            return self._add(mv)
-        deff('__wbg_set_08463b1df38a7e29', [I32, I32, I32], [I32], map_set)
-
-        def grv_mem(ptr, ln):
-            # globalThis.crypto.getRandomValues(IEA(ptr, len)): fill wasm memory directly
-            self.mem_write(ptr, os.urandom(ln))
-        deff('__wbg_getRandomValues_d49329ff89a07af1', [I32, I32], [], grv_mem)
-
-        def grv_arr(crypto_i, arr_i):
-            arr = self._get(arr_i)
-            log('getRandomValues(arr)', type(arr), len(arr) if isinstance(arr, FakeU8) else None)
-            if isinstance(arr, FakeU8):
-                arr.write(os.urandom(len(arr)))
-        deff('__wbg_getRandomValues_c44a50d8cfdaebeb', [I32, I32], [], grv_arr)
-
-        deff('__wbg_crypto_38df2bab126b63dc', [I32], [I32], lambda g: self._add(CRYPTO))
-        deff('__wbg_process_44c7a14e11e9f69e', [I32], [I32], lambda g: self._add(PROCESS))
-        deff('__wbg_versions_276b2795b1c6a219', [I32], [I32], lambda p: self._add(VERSIONS))
-        deff('__wbg_node_84ea875411254db1', [I32], [I32], lambda v: self._add('24.3.0'))
-        deff('__wbg_require_b4edbdcf3e2a1ef0', [], [I32], lambda: self._add(CRYPTO))
-        deff('__wbg_msCrypto_bd5a034af96bcba6', [I32], [I32], lambda g: self._add(CRYPTO))
-
-        def rfs(mod_i, arr_i):
-            arr = self._get(arr_i)
-            log('randomFillSync', type(arr))
-            if isinstance(arr, FakeU8):
-                arr.write(os.urandom(len(arr)))
-            self._drop(arr_i)
-        deff('__wbg_randomFillSync_6c25eac9869eb53c', [I32, I32], [], rfs)
-
-        def call_(fn_i, this_i, arg_i):
-            fn, this, arg = self._get(fn_i), self._get(this_i), self._get(arg_i)
-            log('call', fn, this, arg)
-            if fn == 'getRandomValues' and isinstance(arg, FakeU8):
-                arg.write(os.urandom(len(arg)))
-                return 0
-            return 0
-        deff('__wbg_call_d578befcc3145dee', [I32, I32, I32], [I32], call_)
-
-        deff('__wbindgen_object_clone_ref', [I32], [I32], lambda i: self._add(self._get(i)))
-        deff('__wbg_new_with_length_9cedd08484b73942', [I32], [I32], lambda n: self._add(FakeU8(n)))
-
-        def length_(i):
-            v = self._get(i)
-            if isinstance(v, FakeU8):
-                return len(v)
-            if isinstance(v, (str, bytes, list, dict)):
-                return len(v)
-            return 0
-        deff('__wbg_length_0c32cb8543c8e4c8', [I32], [I32], length_)
-
-        def setcall(ptr, ln, arr_i):
-            # Uint8Array.prototype.set.call(IEA(ptr,len), heap[arr_i]): copy JS array into wasm mem
-            src = self._get(arr_i)
-            log('u8.set into mem', ptr, ln, type(src))
-            if isinstance(src, FakeU8):
-                self.mem_write(ptr, bytes(src.read()))
-        deff('__wbg_prototypesetcall_3e05eb9545565046', [I32, I32, I32], [], setcall)
-
-        def subarray(arr_i, begin, end):
-            arr = self._get(arr_i)
-            if isinstance(arr, FakeU8):
-                if arr.ptr is not None:
-                    return self._add(FakeU8(end - begin, harness=self, ptr=arr.ptr + begin))
-                return self._add(FakeU8(arr.read()[begin:end]))
-            return self._add(FakeU8(0))
-        deff('__wbg_subarray_0f98d3fb634508ad', [I32, I32, I32], [I32], subarray)
-
-        deff('__wbg_new_99cabae501c0a8a0', [], [I32], lambda: self._add(FakeMap()))
-        deff('__wbg_now_88621c9c9a4f3ffc', [], [F64], lambda: time.time() * 1000.0)
-
-        deff('__wbg_static_accessor_GLOBAL_THIS_a1248013d790bf5f', [], [I32], lambda: self._add(GLOBAL))
-        deff('__wbg_static_accessor_SELF_24f78b6d23f286ea', [], [I32], lambda: self._add(GLOBAL))
-        deff('__wbg_static_accessor_GLOBAL_f2e0f995a21329ff', [], [I32], lambda: self._add(GLOBAL))
-        deff('__wbg_static_accessor_WINDOW_59fd959c540fe405', [], [I32], lambda: 0)
-
-        def throw_(ptr, ln):
-            msg = self.read_str(ptr, ln)
-            raise RuntimeError('wasm throw: ' + msg)
-        deff('__wbg___wbindgen_throw_81fc77679af83bc6', [I32, I32], [], throw_)
-
-        def error_(ptr, ln):
-            return self._add({'error': self.read_str(ptr, ln)})
-        deff('__wbg_Error_2e59b1b37a9a34c3', [I32, I32], [I32], error_)
-
-        deff('__wbg___wbindgen_is_object_40c5a80572e8f9d3', [I32], [I32],
-             lambda i: 1 if isinstance(self._get(i), (dict, FakeU8, FakeMap)) and self._get(i) is not NULL else 0)
-        deff('__wbg___wbindgen_is_string_b29b5c5a8065ba1a', [I32], [I32],
-             lambda i: 1 if isinstance(self._get(i), str) else 0)
-        deff('__wbg___wbindgen_is_function_49868bde5eb1e745', [I32], [I32], lambda i: 0)
-        deff('__wbg___wbindgen_is_undefined_c0cca72b82b86f4d', [I32], [I32],
-             lambda i: 1 if self._get(i) is UNDEFINED else 0)
-
-        def cast1(ptr, ln):
-            return self._add(FakeU8(ln, harness=self, ptr=ptr))
-        deff('__wbindgen_cast_0000000000000001', [I32, I32], [I32], cast1)
-
-        def cast2(ptr, ln):
-            return self._add(self.read_str(ptr, ln))
-        deff('__wbindgen_cast_0000000000000002', [I32, I32], [I32], cast2)
-
-    # ---- public API ----
-    def call_str_fn(self, name, *strs, extra_check=True):
-        """call exported fn(retptr, ptr,len ...) -> string via [retptr],[retptr+4]; err flag at +8"""
-        fn = self.ex[name]
-        retptr = self.ssp(self.store, -16)
-        args = [retptr]
-        for s in strs:
-            p, l = self.pass_str(s)
-            args += [p, l]
-        fn(self.store, *args)
-        flag = struct.unpack('<I', self.mem_read(retptr + 8, 4))[0]
-        if flag and extra_check:
-            self.ssp(self.store, 16)
-            raise RuntimeError(f'{name} returned error flag')
-        s = self.ret_str(retptr)
-        self.ssp(self.store, 16)
-        return s
-
-    def credential_encrypt(self, json_str, key16):
-        return self.call_str_fn('credential_storage_encrypt', json_str, key16)
-
-    def credential_decrypt(self, blob_str, key16):
-        return self.call_str_fn('credential_storage_decrypt', blob_str, key16)
-
-    def gen_runtime_auth_fields(self, userinfo_json):
-        return self.call_str_fn('generate_runtime_auth_fields', userinfo_json)
-
-    def new_context(self, machine_id, version, userinfo_json, scene_json):
-        retptr = self.ssp(self.store, -16)
-        args = [retptr]
-        for s in (machine_id, version, userinfo_json, scene_json):
-            p, l = self.pass_str(s)
-            args += [p, l]
-        self.ex['qodercontext_new'](self.store, *args)
-        ptr, err, flag = struct.unpack('<III', self.mem_read(retptr, 12))
-        self.ssp(self.store, 16)
-        if flag:
-            raise RuntimeError(f'qodercontext_new failed: {self.heap[err]}')
-        return ptr
-
-    def prepare_infer_request(self, ctx, endpoint, body_json, model_key, model_source):
-        retptr = self.ssp(self.store, -16)
-        args = [retptr, ctx]
-        for s in (endpoint, body_json, model_key, model_source):
-            p, l = self.pass_str(s)
-            args += [p, l]
-        self.ex['qodercontext_prepareInferRequest'](self.store, *args)
-        ptr, err, flag = struct.unpack('<III', self.mem_read(retptr, 12))
-        self.ssp(self.store, 16)
-        if flag:
-            raise RuntimeError(f'prepareInferRequest failed: {self.heap[err]}')
-        return ptr
-
-    def result_url(self, rptr):
-        retptr = self.ssp(self.store, -16)
-        self.ex['requestresult_url'](self.store, retptr, rptr)
-        s = self.ret_str(retptr)
-        self.ssp(self.store, 16)
-        return s
-
-    def result_headers(self, rptr):
-        idx = self.ex['requestresult_headers'](self.store, rptr)
-        return dict(self.heap[idx]) if isinstance(self.heap[idx], FakeMap) else self.heap[idx]
-
-    def result_body(self, rptr):
-        retptr = self.ssp(self.store, -16)
-        self.ex['requestresult_body'](self.store, retptr, rptr)
-        ptr, ln = struct.unpack('<II', self.mem_read(retptr, 8))
-        self.ssp(self.store, 16)
+    def _read_guest_string(self, ptr, length):
         if ptr == 0:
-            return None
-        s = self.read_str(ptr, ln)
-        self.free(self.store, ptr, ln, 1)
-        return s
+            if length != 0:
+                raise HarnessError("abi-zero-string-pointer")
+            return ""
+        try:
+            return self.read_str(ptr, length)
+        finally:
+            self.free(self.store, ptr, length, 1)
+
+    def _define_imports(self):
+        linker = self.linker
+        store = self.store
+        module = "./qoder_auth_wasm_bg.js"
+        i32 = self.ValType.i32()
+        f64 = self.ValType.f64()
+
+        def define(name, params, results, function):
+            linker.define(store, module, name, self.Func(store, self.FuncType(params, results), function))
+
+        define("__wbindgen_object_drop_ref", [i32], [], lambda index: self._drop(index))
+
+        def map_set(map_index, key_index, value_index):
+            target = self._get(map_index)
+            if isinstance(target, (FakeMap, dict)):
+                target[self._get(key_index)] = self._get(value_index)
+            return self._add(target)
+
+        define("__wbg_set_08463b1df38a7e29", [i32, i32, i32], [i32], map_set)
+        define("__wbg_getRandomValues_d49329ff89a07af1", [i32, i32], [], lambda ptr, length: self.mem_write(ptr, self._entropy(length)))
+
+        def fill_array(_crypto_index, array_index):
+            array = self._get(array_index)
+            if not isinstance(array, FakeU8):
+                raise HarnessError("host-random-target")
+            array.write(self._entropy(len(array)))
+
+        define("__wbg_getRandomValues_c44a50d8cfdaebeb", [i32, i32], [], fill_array)
+        define("__wbg_crypto_38df2bab126b63dc", [i32], [i32], lambda _index: self._add(CRYPTO))
+        define("__wbg_process_44c7a14e11e9f69e", [i32], [i32], lambda _index: self._add(PROCESS))
+        define("__wbg_versions_276b2795b1c6a219", [i32], [i32], lambda _index: self._add(VERSIONS))
+        define("__wbg_node_84ea875411254db1", [i32], [i32], lambda _index: self._add("24.3.0"))
+        define("__wbg_require_b4edbdcf3e2a1ef0", [], [i32], lambda: self._add(CRYPTO))
+        define("__wbg_msCrypto_bd5a034af96bcba6", [i32], [i32], lambda _index: self._add(CRYPTO))
+
+        def random_fill_sync(_module_index, array_index):
+            array = self._get(array_index)
+            try:
+                if not isinstance(array, FakeU8):
+                    raise HarnessError("host-random-target")
+                array.write(self._entropy(len(array)))
+            finally:
+                self._drop(array_index)
+
+        define("__wbg_randomFillSync_6c25eac9869eb53c", [i32, i32], [], random_fill_sync)
+
+        def call(function_index, _this_index, argument_index):
+            function = self._get(function_index)
+            argument = self._get(argument_index)
+            if function == "getRandomValues" and isinstance(argument, FakeU8):
+                argument.write(self._entropy(len(argument)))
+            return 0
+
+        define("__wbg_call_d578befcc3145dee", [i32, i32, i32], [i32], call)
+        define("__wbindgen_object_clone_ref", [i32], [i32], lambda index: self._add(self._get(index)))
+        define("__wbg_new_with_length_9cedd08484b73942", [i32], [i32], lambda length: self._add(FakeU8(length)))
+
+        def length(index):
+            value = self._get(index)
+            return js_utf16_length(value) if isinstance(value, (FakeU8, str, bytes, list, dict)) else 0
+
+        define("__wbg_length_0c32cb8543c8e4c8", [i32], [i32], length)
+
+        def set_call(ptr, length, array_index):
+            source = self._get(array_index)
+            if not isinstance(source, FakeU8) or len(source) != length:
+                raise HarnessError("host-array-length")
+            self.mem_write(ptr, bytes(source.read()))
+
+        define("__wbg_prototypesetcall_3e05eb9545565046", [i32, i32, i32], [], set_call)
+
+        def subarray(array_index, begin, end):
+            array = self._get(array_index)
+            if not isinstance(array, FakeU8) or begin < 0 or end < begin or end > len(array):
+                raise HarnessError("host-subarray-bounds")
+            if array.ptr is not None:
+                return self._add(FakeU8(end - begin, harness=self, ptr=array.ptr + begin))
+            return self._add(FakeU8(array.read()[begin:end]))
+
+        define("__wbg_subarray_0f98d3fb634508ad", [i32, i32, i32], [i32], subarray)
+        define("__wbg_new_99cabae501c0a8a0", [], [i32], lambda: self._add(FakeMap()))
+        define("__wbg_now_88621c9c9a4f3ffc", [], [f64], self._now)
+        define("__wbg_static_accessor_GLOBAL_THIS_a1248013d790bf5f", [], [i32], lambda: self._add(GLOBAL))
+        define("__wbg_static_accessor_SELF_24f78b6d23f286ea", [], [i32], lambda: self._add(GLOBAL))
+        define("__wbg_static_accessor_GLOBAL_f2e0f995a21329ff", [], [i32], lambda: self._add(GLOBAL))
+        define("__wbg_static_accessor_WINDOW_59fd959c540fe405", [], [i32], lambda: 0)
+        define("__wbg___wbindgen_throw_81fc77679af83bc6", [i32, i32], [], lambda _ptr, _length: (_ for _ in ()).throw(HarnessError("wasm-throw")))
+        define("__wbg_Error_2e59b1b37a9a34c3", [i32, i32], [i32], lambda _ptr, _length: self._add({"error": True}))
+        define("__wbg___wbindgen_is_object_40c5a80572e8f9d3", [i32], [i32], lambda index: 1 if isinstance(self._get(index), (dict, FakeU8, FakeMap)) and self._get(index) is not NULL else 0)
+        define("__wbg___wbindgen_is_string_b29b5c5a8065ba1a", [i32], [i32], lambda index: 1 if isinstance(self._get(index), str) else 0)
+        define("__wbg___wbindgen_is_function_49868bde5eb1e745", [i32], [i32], lambda _index: 0)
+        define("__wbg___wbindgen_is_undefined_c0cca72b82b86f4d", [i32], [i32], lambda index: 1 if self._get(index) is UNDEFINED else 0)
+        define("__wbindgen_cast_0000000000000001", [i32, i32], [i32], lambda ptr, length: self._add(FakeU8(length, harness=self, ptr=ptr)))
+        define("__wbindgen_cast_0000000000000002", [i32, i32], [i32], lambda ptr, length: self._add(self.read_str(ptr, length)))
+
+    def call_str_fn(self, name, *values):
+        retptr = self.ssp(self.store, -16)
+        try:
+            args = [retptr]
+            for value in values:
+                ptr, length = self.pass_str(value)
+                args.extend((ptr, length))
+            self.ex[name](self.store, *args)
+            ptr, length, error_ref, error_flag = decode_string_result(self.mem_read(retptr, 16))
+            if error_flag:
+                self._take(error_ref)
+                raise HarnessError("wasm-result-error")
+            return self._read_guest_string(ptr, length)
+        finally:
+            self.ssp(self.store, 16)
+
+    def credential_encrypt(self, plain, key):
+        return self.call_str_fn("credential_storage_encrypt", plain, key)
+
+    def credential_decrypt(self, encrypted, key):
+        return self.call_str_fn("credential_storage_decrypt", encrypted, key)
+
+    def gen_runtime_auth_fields(self, raw):
+        return self.call_str_fn("generate_runtime_auth_fields", raw)
+
+    def model_cache_encrypt(self, plain, uid):
+        return self.call_str_fn("model_cache_encrypt", plain, uid)
+
+    def model_cache_decrypt(self, encrypted, uid):
+        return self.call_str_fn("model_cache_decrypt", encrypted, uid)
+
+    def new_context(self, machine_id, version, user_json, scene_json):
+        retptr = self.ssp(self.store, -16)
+        try:
+            args = [retptr]
+            for value in (machine_id, version, user_json, scene_json):
+                ptr, length = self.pass_str(value)
+                args.extend((ptr, length))
+            self.ex["qodercontext_new"](self.store, *args)
+            ptr, error_ref, error_flag = decode_object_result(self.mem_read(retptr, 12))
+            if error_flag:
+                self._take(error_ref)
+                raise HarnessError("wasm-result-error")
+            return ptr
+        finally:
+            self.ssp(self.store, 16)
+
+    def free_context(self, ptr):
+        self.ex["__wbg_qodercontext_free"](self.store, ptr, 0)
+
+    def prepare_infer_request(self, context_ptr, endpoint, body_json, model_key, model_source):
+        retptr = self.ssp(self.store, -16)
+        try:
+            args = [retptr, context_ptr]
+            for value in (endpoint, body_json, model_key, model_source):
+                ptr, length = self.pass_str(value)
+                args.extend((ptr, length))
+            self.ex["qodercontext_prepareInferRequest"](self.store, *args)
+            ptr, error_ref, error_flag = decode_object_result(self.mem_read(retptr, 12))
+            if error_flag:
+                self._take(error_ref)
+                raise HarnessError("wasm-result-error")
+            return ptr
+        finally:
+            self.ssp(self.store, 16)
+
+    def free_request_result(self, ptr):
+        self.ex["__wbg_requestresult_free"](self.store, ptr, 0)
+
+    def result_string(self, name, result_ptr):
+        retptr = self.ssp(self.store, -16)
+        try:
+            self.ex[name](self.store, retptr, result_ptr)
+            ptr, length = struct.unpack("<II", self.mem_read(retptr, 8))
+            return self._read_guest_string(ptr, length)
+        finally:
+            self.ssp(self.store, 16)
+
+    def result_headers(self, result_ptr):
+        index = self.ex["requestresult_headers"](self.store, result_ptr)
+        try:
+            value = self._get(index)
+            if not isinstance(value, FakeMap):
+                raise HarnessError("abi-header-map")
+            return dict(value)
+        finally:
+            self._drop(index)
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Run qoder_auth_wasm locally for authorized interoperability analysis."
+def load_fixture_document(directory, name):
+    try:
+        encoded = read_bounded_regular_file(os.path.join(directory, name), 2 * 1024 * 1024, "fixture-read")
+        if not encoded.endswith(b"\n") or encoded.endswith(b"\n\n") or b"\r\n" in encoded:
+            raise HarnessError("fixture-line-endings")
+        text = encoded.decode("utf-8")
+        return encoded, json.loads(text)
+    except HarnessError:
+        raise
+    except UnicodeDecodeError as error:
+        raise HarnessError("unicode-invalid") from error
+    except ValueError as error:
+        raise HarnessError("fixture-read") from error
+
+
+def require_exact_keys(value, keys, category="fixture-schema"):
+    if not isinstance(value, dict) or set(value) != set(keys):
+        raise HarnessError(category)
+
+
+def validate_fixture_schema(name, fixture):
+    require_exact_keys(fixture, ("oracle", "input", "transcript", "expected"))
+    if fixture["oracle"] != ORACLE_IDENTITY:
+        raise HarnessError("fixture-oracle-identity")
+    transcript = fixture["transcript"]
+    require_exact_keys(transcript, ("unix_milli", "entropy_reads"))
+    if transcript["unix_milli"] is not None and not isinstance(transcript["unix_milli"], list):
+        raise HarnessError("fixture-schema")
+    if not isinstance(transcript["entropy_reads"], list):
+        raise HarnessError("fixture-schema")
+    for entry in transcript["entropy_reads"]:
+        require_exact_keys(entry, ("length", "bytes"))
+        if not isinstance(entry["length"], int) or entry["length"] < 0 or not isinstance(entry["bytes"], str):
+            raise HarnessError("fixture-schema")
+        try:
+            decoded = base64.b64decode(entry["bytes"], validate=True)
+        except (ValueError, TypeError) as error:
+            raise HarnessError("fixture-schema") from error
+        if len(decoded) != entry["length"]:
+            raise HarnessError("fixture-schema")
+    input_value = fixture["input"]
+    expected = fixture["expected"]
+    if name == "credential.json":
+        require_exact_keys(input_value, ("machine_key", "plain"))
+        require_exact_keys(expected, ("decrypted", "encrypted"))
+        if input_value["machine_key"] != "00000000-1111-42" or input_value["plain"] != expected["decrypted"]:
+            raise HarnessError("fixture-synthetic-schema")
+    elif name == "runtime-fields.json":
+        require_exact_keys(input_value, ("raw",))
+        require_exact_keys(expected, ("raw", "encrypt_user_info", "key"))
+        try:
+            runtime_input = json.loads(input_value["raw"])
+        except (TypeError, ValueError) as error:
+            raise HarnessError("fixture-synthetic-schema") from error
+        if runtime_input.get("uid") != "synthetic-user-0001" or runtime_input.get("organization_id") != "synthetic-org-0001":
+            raise HarnessError("fixture-synthetic-schema")
+    elif name == "model-cache.json":
+        require_exact_keys(input_value, ("plain", "uid"))
+        require_exact_keys(expected, ("decrypted", "encrypted"))
+        if input_value["uid"] != "synthetic-user-0001" or input_value["plain"] != expected["decrypted"]:
+            raise HarnessError("fixture-synthetic-schema")
+    elif name == "infer-user.json":
+        require_exact_keys(input_value, ("machine_id", "version", "user", "scene", "endpoint", "body_raw", "model_key", "model_source"))
+        require_exact_keys(expected, ("url", "header", "body_string", "body_bytes"))
+        if input_value["machine_id"] != "00000000-1111-4222-8333-444444444444" or input_value["version"] != "1.1.34" or input_value["endpoint"] != "https://example.invalid/base":
+            raise HarnessError("fixture-synthetic-schema")
+        if input_value["user"].get("uid") != "synthetic-user-0001" or input_value["user"].get("organization_id") != "synthetic-org-0001":
+            raise HarnessError("fixture-synthetic-schema")
+    else:
+        raise HarnessError("fixture-schema")
+
+
+def validate_fixture_set(directory):
+    try:
+        present = {name for name in os.listdir(directory) if name.endswith(".json")}
+    except OSError as error:
+        raise HarnessError("fixture-read") from error
+    if present != FIXTURE_JSON_NAMES:
+        raise HarnessError("fixture-inventory")
+    manifest_bytes, manifest = load_fixture_document(directory, "manifest.json")
+    del manifest_bytes
+    require_exact_keys(manifest, ("version", "size", "sha256", "documents"), "fixture-manifest-schema")
+    if {key: manifest[key] for key in ("version", "size", "sha256")} != ORACLE_IDENTITY:
+        raise HarnessError("fixture-oracle-identity")
+    if manifest["documents"] != PINNED_FIXTURE_HASHES:
+        raise HarnessError("fixture-manifest-hash")
+    fixtures = {}
+    for name in FIXTURE_NAMES:
+        encoded, fixture = load_fixture_document(directory, name)
+        if hashlib.sha256(encoded).hexdigest() != PINNED_FIXTURE_HASHES[name]:
+            raise HarnessError("fixture-document-hash")
+        validate_fixture_schema(name, fixture)
+        fixtures[name] = fixture
+    return fixtures
+
+
+def compact_json(value):
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def expected_header_map(value):
+    return {key.lower(): entries[0] for key, entries in value.items()}
+
+
+def actual_header_map(value):
+    return {str(key).lower(): str(entry) for key, entry in value.items()}
+
+
+def verify_fixtures(wasm_bytes, fixtures):
+    wasm = WasmBound(wasm_bytes)
+
+    fixture = fixtures["credential.json"]
+    replay = TranscriptReplay.from_fixture(fixture["transcript"], [])
+    wasm.set_replay(replay)
+    encrypted = wasm.credential_encrypt(fixture["input"]["plain"], fixture["input"]["machine_key"])
+    decrypted = wasm.credential_decrypt(encrypted, fixture["input"]["machine_key"])
+    replay.exhausted()
+    if encrypted != fixture["expected"]["encrypted"] or decrypted != fixture["expected"]["decrypted"]:
+        raise HarnessError("credential-output")
+    print(safe_line("credential", replay.shape(), True))
+
+    fixture = fixtures["runtime-fields.json"]
+    entropy_lengths = [entry["length"] for entry in fixture["transcript"]["entropy_reads"]]
+    replay = TranscriptReplay.from_fixture(fixture["transcript"], [("entropy", length) for length in entropy_lengths])
+    wasm.set_replay(replay)
+    raw = wasm.gen_runtime_auth_fields(fixture["input"]["raw"])
+    replay.exhausted()
+    if raw != fixture["expected"]["raw"]:
+        raise HarnessError("runtime-output")
+    print(safe_line("runtime", replay.shape(), True))
+
+    fixture = fixtures["model-cache.json"]
+    entropy_lengths = [entry["length"] for entry in fixture["transcript"]["entropy_reads"]]
+    replay = TranscriptReplay.from_fixture(fixture["transcript"], [("entropy", length) for length in entropy_lengths])
+    wasm.set_replay(replay)
+    encrypted = wasm.model_cache_encrypt(fixture["input"]["plain"], fixture["input"]["uid"])
+    replay.exhausted()
+    decrypt_replay = TranscriptReplay([], [], [])
+    wasm.set_replay(decrypt_replay)
+    decrypted = wasm.model_cache_decrypt(encrypted, fixture["input"]["uid"])
+    decrypt_replay.exhausted()
+    if encrypted != fixture["expected"]["encrypted"] or decrypted != fixture["expected"]["decrypted"]:
+        raise HarnessError("model-cache-output")
+    print(safe_line("model-cache", replay.shape(), True))
+
+    fixture = fixtures["infer-user.json"]
+    transcript = fixture["transcript"]
+    reads = transcript["entropy_reads"]
+    new_transcript = {"unix_milli": [], "entropy_reads": reads[:2]}
+    new_order = [("entropy", entry["length"]) for entry in reads[:2]]
+    new_replay = TranscriptReplay.from_fixture(new_transcript, new_order)
+    wasm.set_replay(new_replay)
+    context_ptr = wasm.new_context(
+        fixture["input"]["machine_id"],
+        fixture["input"]["version"],
+        compact_json(fixture["input"]["user"]),
+        compact_json(fixture["input"]["scene"]),
     )
-    parser.add_argument(
+    try:
+        new_replay.exhausted()
+        prepare_transcript = {"unix_milli": transcript["unix_milli"], "entropy_reads": reads[2:]}
+        prepare_order = [("clock",)] + [("entropy", entry["length"]) for entry in reads[2:]]
+        prepare_replay = TranscriptReplay.from_fixture(prepare_transcript, prepare_order)
+        wasm.set_replay(prepare_replay)
+        result_ptr = wasm.prepare_infer_request(
+            context_ptr,
+            fixture["input"]["endpoint"],
+            fixture["input"]["body_raw"],
+            fixture["input"]["model_key"],
+            fixture["input"]["model_source"],
+        )
+        try:
+            url = wasm.result_string("requestresult_url", result_ptr)
+            headers = wasm.result_headers(result_ptr)
+            body = wasm.result_string("requestresult_body", result_ptr)
+        finally:
+            wasm.free_request_result(result_ptr)
+        prepare_replay.exhausted()
+    finally:
+        wasm.free_context(context_ptr)
+    expected = fixture["expected"]
+    if url != expected["url"] or body != expected["body_string"]:
+        raise HarnessError("infer-output")
+    if actual_header_map(headers) != expected_header_map(expected["header"]):
+        raise HarnessError("infer-headers")
+    combined_shape = f"new[{new_replay.shape()}],prepare[{prepare_replay.shape()}]"
+    print(safe_line("infer", combined_shape, True))
+
+
+def isolated_go_environment(source=None):
+    environment = dict(os.environ if source is None else source)
+    environment["GOWORK"] = "off"
+    environment["GOPROXY"] = "off"
+    return environment
+
+
+def run_go_oracle(arguments):
+    module_directory = os.path.join(REPO_ROOT, "tools", "wasm_oracle")
+    argv = ["go", "run", "."] + list(arguments)
+    try:
+        return subprocess.run(
+            argv,
+            cwd=module_directory,
+            env=isolated_go_environment(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=120,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise HarnessError("backend-go-launch") from error
+
+
+def parse_go_records(completed, expected_records, category):
+    try:
+        lines = completed.stdout.decode("utf-8").splitlines()
+        records = [json.loads(line) for line in lines]
+    except (UnicodeDecodeError, ValueError) as error:
+        raise HarnessError("backend-go-output") from error
+    if completed.returncode != 0 or records != expected_records or completed.stderr:
+        raise HarnessError(category)
+    return lines
+
+
+def validate_with_go_backend(fixture_directory):
+    completed = run_go_oracle([
+        "--fixtures",
+        os.path.abspath(fixture_directory),
+        "validate-fixtures",
+    ])
+    parse_go_records(
+        completed,
+        [{"operation": "validate-fixtures", "transcript": "static", "result": "PASS"}],
+        "backend-go-validation",
+    )
+
+
+def verify_with_go_backend(wasm_path, fixture_directory):
+    completed = run_go_oracle([
         "--wasm",
-        default=DEFAULT_WASM,
-        help="path to qoder_auth_wasm_bg.wasm (default: repository asset)",
-    )
-    commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("demo", help="load the module and list relevant exports")
+        os.path.abspath(wasm_path),
+        "--fixtures",
+        os.path.abspath(fixture_directory),
+        "verify-fixtures",
+    ])
+    expected_records = [
+        {"operation": "credential", "transcript": "clock:0,entropy:none", "result": "PASS"},
+        {"operation": "runtime", "transcript": "clock:0,entropy:16,109", "result": "PASS"},
+        {"operation": "model-cache", "transcript": "clock:0,entropy:12", "result": "PASS"},
+        {"operation": "infer", "transcript": "new[clock:0,entropy:16,109],prepare[clock:1,entropy:16]", "result": "PASS"},
+    ]
+    lines = parse_go_records(completed, expected_records, "backend-go-verify")
+    for line in lines:
+        print(line)
 
-    decrypt = commands.add_parser("decrypt", help="decrypt an explicitly supplied credential file")
-    decrypt.add_argument("credential_file")
-    decrypt.add_argument("machine_id_file")
 
-    genkey = commands.add_parser("genkey", help="generate runtime fields from an explicit UserInfo JSON file")
-    genkey.add_argument("userinfo_file")
-    return parser.parse_args()
+def run_guarded(action):
+    try:
+        action()
+        return 0
+    except HarnessError as error:
+        print(safe_line("verify-fixtures", "unavailable", False, error.category))
+        return 1
+    except Exception:
+        print(safe_line("verify-fixtures", "unavailable", False, "internal"))
+        return 1
 
 
-def main():
-    args = parse_args()
-    wasm = WasmBound(args.wasm)
-    if args.command == "demo":
-        names = [name for name in wasm.ex if "qoder" in name or "request" in name]
-        print("harness ok; exports:", names)
-        return
+def run_self_tests():
+    encoded = struct.pack("<IIII", 11, 22, 33, 44)
+    if decode_string_result(encoded) != (11, 22, 33, 44):
+        raise HarnessError("self-test-string-layout")
+    if decode_object_result(encoded[:12]) != (11, 22, 33):
+        raise HarnessError("self-test-object-layout")
+    try:
+        validate_wasm_bytes(b"abc", expected_size=3, expected_sha256=hashlib.sha256(b"abd").hexdigest())
+    except HarnessError as error:
+        if error.category != "wasm-identity-sha256":
+            raise
+    else:
+        raise HarnessError("self-test-identity")
+    replay = TranscriptReplay([1234], [(2, b"ab")], [("clock",), ("entropy", 2)])
+    if replay.now() != 1234.0 or replay.read(2) != b"ab":
+        raise HarnessError("self-test-replay")
+    replay.exhausted()
+    line = safe_line("synthetic", "clock:0,entropy:none", False, "synthetic-category")
+    for forbidden in ("Authorization", "secret", "uid", "organization"):
+        if forbidden in line:
+            raise HarnessError("self-test-redaction")
+    with tempfile.NamedTemporaryFile() as temporary:
+        temporary.write(b"not-wasm")
+        temporary.flush()
+        try:
+            load_authorized_wasm(temporary.name)
+        except HarnessError as error:
+            if error.category != "wasm-identity-size":
+                raise
+        else:
+            raise HarnessError("self-test-path-identity")
+    if js_utf16_length("A\U0001f600B") != 4:
+        raise HarnessError("self-test-utf16-length")
+    try:
+        js_utf16_length("\ud800")
+    except HarnessError as error:
+        if error.category != "unicode-invalid":
+            raise
+    else:
+        raise HarnessError("self-test-unicode-invalid")
+    try:
+        validate_fixture_schema("credential.json", {"oracle": ORACLE_IDENTITY})
+    except HarnessError as error:
+        if error.category != "fixture-schema":
+            raise
+    else:
+        raise HarnessError("self-test-schema")
+    with tempfile.TemporaryDirectory() as directory:
+        for name in FIXTURE_JSON_NAMES:
+            with open(os.path.join(DEFAULT_FIXTURES, name), "rb") as source:
+                data = source.read()
+            with open(os.path.join(directory, name), "wb") as destination:
+                destination.write(data)
+        credential_path = os.path.join(directory, "credential.json")
+        with open(credential_path, encoding="utf-8") as source:
+            credential = json.load(source)
+        credential["expected"]["encrypted"] = "synthetic-tampered-value"
+        credential_bytes = (json.dumps(credential, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+        with open(credential_path, "wb") as destination:
+            destination.write(credential_bytes)
+        manifest_path = os.path.join(directory, "manifest.json")
+        with open(manifest_path, encoding="utf-8") as source:
+            manifest = json.load(source)
+        manifest["documents"]["credential.json"] = hashlib.sha256(credential_bytes).hexdigest()
+        with open(manifest_path, "w", encoding="utf-8", newline="\n") as destination:
+            destination.write(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n")
+        try:
+            validate_fixture_set(directory)
+        except HarnessError as error:
+            if error.category != "fixture-manifest-hash":
+                raise
+        else:
+            raise HarnessError("self-test-recomputed-manifest")
+    hostile_workspace = "/nonexistent/private/workspace-leak"
+    isolated = isolated_go_environment({"GOWORK": hostile_workspace, "GOPROXY": "https://example.invalid/proxy", "PATH": os.environ.get("PATH", "")})
+    if isolated.get("GOWORK") != "off" or isolated.get("GOPROXY") != "off" or hostile_workspace in repr(isolated):
+        raise HarnessError("self-test-go-isolation")
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    sentinel = "Authorization synthetic-access-token traceback-sentinel"
+    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+        status = run_guarded(lambda: (_ for _ in ()).throw(ValueError(sentinel)))
+    guarded_output = stdout.getvalue() + stderr.getvalue()
+    if status != 1 or "category=internal" not in guarded_output:
+        raise HarnessError("self-test-unexpected-error")
+    if any(value in guarded_output for value in (sentinel, "Traceback", "Authorization", "synthetic-access-token")):
+        raise HarnessError("self-test-redaction")
+    print(safe_line("self-test", "static", True))
 
-    print("Sensitive output: do not share or commit it.", file=sys.stderr)
-    if args.command == "decrypt":
-        with open(args.credential_file, encoding="utf-8") as credential_file:
-            blob = credential_file.read().strip()
-        with open(args.machine_id_file, encoding="utf-8") as machine_id_file:
-            key = machine_id_file.read().strip()[:16]
-        print(wasm.credential_decrypt(blob, key))
-        return
 
-    with open(args.userinfo_file, encoding="utf-8") as userinfo_file:
-        print(wasm.gen_runtime_auth_fields(userinfo_file.read()))
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="Verify synthetic frozen fixtures with an operator-supplied authorized WASM oracle.")
+    parser.add_argument("--self-test", action="store_true", help="run dependency-free harness unit tests")
+    parser.add_argument("--wasm", help="mandatory external path to the authorized pinned WASM for verify-fixtures")
+    parser.add_argument("--fixtures", default=DEFAULT_FIXTURES, help="path to the non-secret frozen fixture directory")
+    parser.add_argument("command", nargs="?", choices=("verify-fixtures",))
+    args = parser.parse_args(argv)
+    if args.self_test:
+        if args.command is not None or args.wasm is not None:
+            parser.error("--self-test cannot be combined with --wasm or a command")
+        return args
+    if args.command != "verify-fixtures":
+        parser.error("verify-fixtures is required unless --self-test is used")
+    if not args.wasm:
+        parser.error("--wasm PATH is required for verify-fixtures")
+    return args
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    if args.self_test:
+        return run_guarded(run_self_tests)
+
+    def verify():
+        wasm_bytes = load_authorized_wasm(args.wasm)
+        fixture_directory = os.path.abspath(args.fixtures)
+        validate_with_go_backend(fixture_directory)
+        fixtures = validate_fixture_set(fixture_directory)
+        if importlib.util.find_spec("wasmtime") is not None:
+            verify_fixtures(wasm_bytes, fixtures)
+        else:
+            verify_with_go_backend(args.wasm, fixture_directory)
+
+    return run_guarded(verify)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

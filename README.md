@@ -2,8 +2,7 @@
 
 将 **qodercli 的模型推理能力**中转为标准 API 的本地代理服务。
 
-基于对用户自行合法安装的 Qoder CLI v1.1.5 所做的互操作性分析（见[逆向工程](#6-逆向工程)），
-用 Go 实现并内嵌 Qoder CLI 的认证 WASM，对外提供三种兼容端点：
+当前互操作基线固定为 **Qoder CLI v1.1.34** 的全合成 frozen fixtures。Production 是 **pure Go native-only**：仓库和生产二进制不包含认证 WASM，root module 不依赖 wazero。经授权的运维方仍可使用外部 oracle（297,238 bytes，SHA-256 `b3ddd7c9235cea51a965582506fa6281bb298ddab782ff3edb3f9015da2468d4`）离线复核兼容性。项目对外提供三种兼容端点：
 
 | 端点 | 协议 | 适用客户端 |
 |---|---|---|
@@ -14,7 +13,7 @@
 特性：sk 鉴权 · 16 个上游模型可切换（含 1M 上下文）· thinking/effort 映射 ·
 工具调用双向转换 · token 自动刷新 · 内嵌设备流登录。
 
-> 非官方项目，与 Qoder 或 Alibaba 无隶属、背书或赞助关系。仅使用你自己的合法订阅，并遵守适用的服务条款和法律。第三方 WASM 的许可说明见 [NOTICE](NOTICE)。
+> 非官方项目，与 Qoder 或 Alibaba 无隶属、背书或赞助关系。仅使用你自己的合法订阅，并遵守适用的服务条款和法律。外部 oracle 的授权与商标边界见 [NOTICE](NOTICE)。
 
 ## 目录
 
@@ -34,7 +33,7 @@
 ## 1. 快速开始
 
 ```bash
-# 构建（认证 WASM 已 go:embed；第三方许可见 NOTICE）
+# 构建（pure Go；无 embedded WASM / root wazero dependency）
 cd qodercli2api && go build -o qodercli2api .
 
 # 登录（二选一）
@@ -162,6 +161,10 @@ curl -N -X POST http://127.0.0.1:8377/v1/responses \
 | `-dump-dir` | `QODER2API_DUMP_DIR` | 空 | 将失败请求明文写入 owner-only 文件，仅限本机调试，可能包含提示词和工具数据 |
 | `-v` | `QODER2API_LOG=debug` | off | 详细日志；可能包含上游错误详情，仅限受控环境 |
 
+Production 始终构造 strict native services，不需要也不接受 protocol backend mode 配置。旧的 `-protocol-mode`、`-shadow-capabilities`、`QODER2API_PROTOCOL_MODE` 和 `QODER2API_SHADOW_CAPABILITIES` 已移除；对应 flags 会作为 unknown flag 拒绝，旧环境变量不会被读取。没有运行时 WASM rollback、shadow comparison 或 fallback 路径。
+
+验证证据与授权 E2E 命令见 [§7.1](#71-native-only-验证)。
+
 ### 3.2 端点
 
 | 端点 | 说明 |
@@ -244,15 +247,24 @@ model_auto_compact_token_limit = 900000   # 可选，自动压缩阈值
 Claude Code / Codex / 任意客户端
         │  Anthropic / OpenAI Chat / OpenAI Responses
         ▼
-   qodercli2api
-        ├── sk 鉴权中间件
-        ├── 客户端请求 → RemoteChatAsk 转换
-        ├── wazero 内嵌官方 WASM：prepareInferRequest（URL / 22 个签名头 / 加密 body）
-        ├── token 自动刷新（提前 1h + 401 重试 + 30min 定时）
-        └── 上游 SSE 信封解析 → 客户端协议事件序列
+   server                         catalog loading
+      │                                 │
+      │ 依赖 authManager                │ 依赖 modelCacheDecryptor
+      │                                 │
+      └──────────────┬──────────────────┘
+                     │ 语义接口
+                     ▼
+   authManager（唯一 active protocolContext owner）
+        │  创建、原子替换、关闭 native context；刷新凭证时重建
         ▼
-   https://api2.qoder.sh（生产推理端点）
+   protocolServices（native-only capabilities）
+        ├── nativeCredentialCodec
+        ├── nativeRuntimeFieldGenerator
+        ├── nativeModelCacheDecryptor
+        └── nativeContextFactory → nativeProtocolContext.PrepareInferRequest
 ```
+
+应用层统一拥有 `protocolServices` 生命周期，并在停止接收请求、等待在途 handler 与刷新任务结束后，依次关闭 auth context 和 services。时钟与安全熵通过 host dependency 注入；生产使用 wall clock/`crypto/rand`。deterministic transcript record/replay 仅存在于 `_test.go`，不会进入生产 binary。`testdata/protocol/1.1.34/` 保存全合成、带 manifest hash 的 credential/runtime/model-cache/infer fixtures，作为普通测试的 byte-exact 兼容基线。
 
 ### 5.1 请求转换
 
@@ -282,11 +294,12 @@ stop 映射：`stop→end_turn, tool_calls→tool_use, length→max_tokens, cont
 
 ### 5.3 设计决策
 
-1. **必须内嵌 WASM**：请求体加密与 COSY 签名无法离线重写，wazero 复用官方逻辑，行为与官方天然一致
-2. **凭证复用**：直接读写 `~/.qoder/.auth/user`（与 qodercli 兼容的加密格式），也支持独立设备流登录
-3. **request_id 每次新 UUID**（服务器防重放，重复返回 103）
-4. **单 WASM 上下文 + 互斥锁**：wasm-bindgen 模块非线程安全；打包仅数毫秒，无瓶颈
-5. **usage 捕获**：部分模型的 usage 帧在 finish_reason 之后才到，延迟到 `event:finish` 再发最终事件
+1. **语义边界先行**：server 依赖 `authManager`，catalog loading 依赖 `modelCacheDecryptor`；`authManager` 是唯一 active `protocolContext` owner，`protocolServices` 聚合四个 native capabilities
+2. **production native-only**：credential、runtime auth、model cache、body codec 与完整 COSY request preparation 均由 pure Go 实现；没有 embedded WASM、wazero、mode selector、shadow 或 fallback runtime
+3. **确定性 host 与生命周期**：clock/entropy 可注入；context 深拷贝 immutable state、并发 prepare、幂等关闭并等待在途调用。record/replay 仅用于测试和 external-oracle 证据
+4. **frozen compatibility baseline**：普通 root tests 只读取 synthetic v1.1.34 fixtures；可选 external oracle 独立位于 `tools/wasm_oracle`，需要 operator-supplied authorized WASM
+5. **协议事实**：body 是确定性的自定义 Base64 字母表替换加 outer-third swap，不是加密；COSY 签名是 canonical 输入的 MD5；响应是明文 SSE
+6. **request_id 每次新 UUID**（服务器防重放，重复返回 103）；usage 可能晚于 finish_reason，因此延迟到 `event:finish` 再发最终事件
 
 ---
 
@@ -298,15 +311,15 @@ stop 映射：`stop→end_turn, tool_calls→tool_use, length→max_tokens, cont
 
 | 问题 | 答案 |
 |---|---|
-| OAuth 机制 | **自定义设备授权流**：浏览器开 `qoder.com/device/selectAccounts`（PKCE 风格 challenge），每秒轮询 `openapi.qoder.sh/api/v1/deviceToken/poll` 换 device token；凭证 WASM 加密存于 `~/.qoder/.auth/user` |
-| 推理调用 | `POST api2.qoder.sh/algo/api/v2/service/pro/sse/agent_chat_generation`，22 个 `Cosy-*` 头 + `Bearer COSY.<base64>.<签名>`，请求体 WASM 加密；响应明文 SSE（信封包裹 OpenAI chunk） |
-| 加密/签名 | 内嵌 Rust→WASM 模块 `qoder_auth_wasm_bg.wasm`（297KB），不可绕过，本项目用 wazero 复用 |
+| OAuth 机制 | **自定义设备授权流**：浏览器开 `qoder.com/device/selectAccounts`（PKCE 风格 challenge），每秒轮询 `openapi.qoder.sh/api/v1/deviceToken/poll` 换 device token；凭证以 AES-128-CBC 兼容格式存于 `~/.qoder/.auth/user`，由 native credential service 处理 |
+| 推理调用 | `POST api2.qoder.sh/algo/api/v2/service/pro/sse/agent_chat_generation`，最多 22 个条件请求头（presence matrix 见 [推理协议文档](docs/inference-protocol.md)）+ `Bearer COSY.<base64>.<签名>`；请求体为确定性 custom-Base64/third-swap 编码，响应为明文 SSE（信封包裹 OpenAI chunk） |
+| 编码/签名 | body codec 与 canonical MD5 签名由 byte-exact pure-Go implementation 执行；production 没有其他 backend mode |
 
 ### 6.2 二进制分析
 
-Qoder CLI v1.1.5 是 Bun 打包的 Node.js 单文件可执行程序。互操作性分析识别出内嵌 JS bundle、认证 WASM、原生 addon 和 tree-sitter 模块。
+最初的历史分析对象是 Qoder CLI v1.1.5：它是 Bun 打包的 Node.js 单文件可执行程序，分析识别出内嵌 JS bundle、认证 WASM、原生 addon 和 tree-sitter 模块。当前兼容性与 fixtures 已重新固定到 v1.1.34 WASM oracle（297,238 bytes；上述 SHA-256），不要把 1.1.5 的历史观察当作当前版本标识。
 
-本仓库不分发 Qoder CLI、完整 JS bundle、原生 addon或 tree-sitter 提取物；只保留代理运行所需的认证 WASM，并在 `NOTICE` 中单独说明其第三方归属和许可边界。
+本仓库不分发 Qoder CLI、认证 WASM、完整 JS bundle、原生 addon 或 tree-sitter 提取物。可选分析工具只读取运维方自行提供且有权执行的外部 oracle；授权和商标边界见 `NOTICE`。
 
 ### 6.3 OAuth 要点
 
@@ -315,7 +328,7 @@ Qoder CLI v1.1.5 是 Bun 打包的 Node.js 单文件可执行程序。互操作�
 - **PAT**：`POST /api/v1/jobToken/exchange {"personal_token":...}`
 - **刷新**：`expire_time-3600<now` 即刷新；`POST /api/v1/deviceToken/refresh {"refresh_token":...}`；
   refresh token 有效期约 4 个月
-- **存储**：`~/.qoder/.auth/user`（0600），WASM `credential_storage_encrypt`，key = `machine_id` 前 16 字符
+- **存储**：`~/.qoder/.auth/user`（0600 原子替换）；AES-128-CBC，raw 16-byte UTF-8 key=`machine_id` 前 16 字符，IV=key，PKCS#7 + strict standard padded Base64；production native codec 与 frozen fixtures byte-exact
 - **端点**：默认生产推理端点为 `api2.qoder.sh`；代码允许运维方通过启动参数覆盖
 
 ### 6.4 推理协议要点
@@ -323,10 +336,10 @@ Qoder CLI v1.1.5 是 Bun 打包的 Node.js 单文件可执行程序。互操作�
 - **认证头**：`Authorization: Bearer COSY.{base64({version,requestId,info,cosyVersion,ideVersion})}.{签名}`，
   其中 `info` 即 `encrypt_user_info`；**设备 token 不上链**，服务器靠 `info`+`Cosy-Key` 认证
 - **请求体**（RemoteChatAsk）：`request_id`（唯一，重复 403）、`session_id`、`model_config`、
-  `system`、`messages`、`tools`、`parameters{max_tokens,reasoning_effort,...}`，整体 WASM 加密
-- **响应**：SSE 信封 `{"headers","body","statusCodeValue"}`，`body` 为字符串化 OpenAI chunk
-  （`content`/`reasoning_content`/流式 `tool_calls`/`finish_reason`/`usage`），
-  `event:finish`（含首 token/总时长）收尾，**无 `[DONE]`**；错误帧 statusCodeValue≠200
+  `system`、`messages`、`tools`、`parameters{max_tokens,reasoning_effort,...}`；raw JSON 经确定性 custom Base64 + outer-third swap 编码，字段顺序/空白敏感
+- **响应**：SSE 信封 `{"headers","body","statusCodeValue"}`，`body` 通常为字符串化 OpenAI chunk
+  （`content`/`reasoning_content`/流式 `tool_calls`/`finish_reason`/`usage`）；有效 200 信封的 `body` 也可能是精确 `[DONE]`，
+  该标记被忽略且不表示上游完成，仍由后续 `event:finish`（含首 token/总时长）权威收尾。不同下游协议的终止帧由代理分别生成；错误帧 statusCodeValue≠200
 
 ### 6.5 qoder_auth_wasm 与分析方法
 
@@ -334,17 +347,48 @@ WASM 导出（wasm-bindgen ABI）：`qodercontext_new` / `qodercontext_prepareIn
 `prepareRequest`（通用打包）/ `credential_storage_encrypt|decrypt`（凭证）/
 `generate_runtime_auth_fields`（运行时签名字段）/ `model_cache_decrypt`（目录）/ `decrypt_server_response`。
 
-**分析方法（本项目原创）**：Python + wasmtime 手写 wasm-bindgen host glue
-（堆、free-list、WASM 内存视图和随机数导入等），用于本地、经授权的互操作性分析。公开工具见 `tools/wasm_harness.py`；它只在用户显式提供输入时执行敏感操作。Go 侧在 `wasm.go` 用 wazero 实现同等 glue。
+**分析方法（本项目原创）**：Python + wasmtime 手写 wasm-bindgen host glue，以及独立 Go/wazero oracle，用于本地、经授权的互操作性分析。可选工具见 [`tools/README.md`](tools/README.md) 与 `tools/wasm_harness.py`：它要求运维方通过 `--wasm PATH` 提供经授权的外部 pinned binary，实例化前校验 size/SHA-256，只对仓库内 synthetic frozen fixtures 做内容静默的 replay/compare。`tools/wasm_oracle` 是独立子模块；root production 构建和普通 Go 测试均不依赖它。
 
 ---
 
 ## 7. 验证记录
 
+### 7.1 Native-only 验证
+
+Production 无需 backend mode：启动只构造 native services；源码、root module 和生产 binary 中没有 WASM runtime、embedded oracle 或 wazero。普通 root tests 只使用 frozen synthetic fixtures 和 native replay；可选 external oracle 独立位于 `tools/`。
+
+迁移前已完成 shadow/native/rollback parity gates；移除后重新执行 native 全矩阵、refresh/context rebuild、完整测试、race、vet、Windows cross-compile、10,000-operation stress、四个 fuzz target、五项 benchmark，以及 dependency/binary-content audit。benchmark 只作为性能证据，不设绝对 pass/fail 阈值。
+
+E2E 直接使用当前机器已授权的生产凭证目录、加密模型缓存和默认生产端点；也可用 `QODER2API_E2E_AUTH_DIR`、`QODER2API_E2E_INFER_ENDPOINT`、`QODER2API_E2E_OPENAPI_ENDPOINT`、`QODER2API_E2E_WEB_ENDPOINT` 做内容静默的受控覆盖。harness 强制关闭 dump-dir，输出只含 `backend=native`、route、stream、HTTP/schema 成功状态、时长与安全 upstream shape。普通 native gate 对真实凭证只读；只有同时设置 `QODER2API_E2E=1` 与 `QODER2API_E2E_REFRESH=1` 的 refresh gate 才允许轮换并持久化真实授权 token。
+
+```bash
+# 无 mode flags 的只读 smoke 与完整 native route matrix
+QODER2API_E2E=1 go test -tags=e2e . -run '^TestProtocolE2EDefaultNative$' -count=1 -v
+QODER2API_E2E=1 go test -tags=e2e . -run '^TestProtocolE2ENative$' -count=1 -v
+
+# 显式授权的 refresh/context rebuild gate
+QODER2API_E2E=1 QODER2API_E2E_REFRESH=1 go test -tags=e2e . -run '^TestProtocolE2ERefresh$' -count=1 -v
+
+# 10,000 次 native runtime/prepares，加上 rebuild/Close ordering
+go test . -run '^TestNative(RuntimeFields|Prepare|ContextRebuild|RepeatedClose)Stress$' -count=1
+
+# 仅报告 Go 标准 benchmark/alloc 指标，不设置任意性能阈值。
+go test . -run '^$' -bench '^BenchmarkNative(Body|Credential|Runtime|ModelCache|Infer)$' -benchmem -count=1
+
+# 仅交叉编译 Windows amd64 测试二进制，不在当前主机执行；临时产物自动删除。
+windows_test_bin="$(mktemp)"
+trap 'rm -f "$windows_test_bin"' EXIT
+GOOS=windows GOARCH=amd64 go test -c -tags=e2e -o "$windows_test_bin" .
+rm -f "$windows_test_bin"
+trap - EXIT
+```
+
 | 测试 | 结果 |
 |---|---|
-| WASM harness 加载与 ABI 调用 | ✅ 认证、签名和目录相关导出可调用 |
-| 使用自有授权账号的端到端互操作验证 | ✅ SSE 流（text/reasoning/tool_calls/usage/event:finish）；仓库不包含凭据、请求或响应抓包 |
+| Frozen 1.1.34 兼容基线 | ✅ 五个 manifest/document hash 固定；credential/runtime-fields/model-cache/infer 由 native deterministic replay 验证 |
+| Optional external oracle | ✅ operator-supplied WASM 的 size/SHA/ABI/fixtures 可由独立 `tools/wasm_oracle` 内容静默复核；不进入 root dependency graph |
+| Native 生命周期与压力 | ✅ concurrent prepare/context rebuild/repeated close；10,000-operation stress；race/fuzz/benchmark evidence |
+| 使用自有授权账号的最终端到端验证 | ✅ native-only 三路由 stream/nonstream、encrypted catalog、default smoke 与 refresh/context rebuild；输出和仓库均不包含凭据、请求、响应内容或抓包 |
 | 相同 request_id 重放 | ✅ 403 `{"code":"103","message":"Duplicate request"}` |
 | Anthropic 非流式 / 流式事件序列 | ✅ thinking+text blocks、message_start→…→message_stop、usage 正确 |
 | 无 sk / 错 sk | ✅ 401 authentication_error |
@@ -364,26 +408,32 @@ WASM 导出（wasm-bindgen ABI）：`qodercontext_new` / `qodercontext_prepareIn
 
 ```
 qodercli2api/
-├── main.go                     # 入口/flags/启动/目录加载/PAT登录
-├── wasm.go                     # wazero host glue + QoderContext API
-├── auth.go                     # 凭证读写/刷新/设备流登录
+├── main.go                     # 入口与信号交给 app.run
+├── app.go                      # flags/env、依赖装配、后台任务与关闭顺序
+├── protocol.go                 # 语义 capability/context 接口
+├── protocol_error.go           # 安全错误分类与内部 cause 边界
+├── protocol_services.go        # native-only service construction/lifecycle
+├── protocol_host.go            # production clock/entropy 注入
+├── native_body_codec.go        # custom Base64 + outer-third swap
+├── native_credential.go        # AES-128-CBC credential compatibility
+├── native_model_cache.go       # QMC v1 HKDF + AES-256-GCM
+├── native_runtime_fields.go    # UUID/AES/RSA runtime auth fields
+├── native_context.go           # immutable concurrent native context
+├── native_infer.go             # COSY URL/headers/payload/signature
+├── auth.go                     # 凭证读写/刷新；protocol context owner
 ├── convert.go                  # Anthropic ↔ RemoteChatAsk 类型转换
-├── proxy.go                    # Anthropic handlers + SSE 解析 + 模型解析
-├── openai.go                   # /v1/chat/completions
-├── responses.go                # /v1/responses
-├── assets/
-│   └── qoder_auth_wasm_bg.wasm # 第三方认证 WASM；许可边界见 NOTICE
+├── proxy.go                    # handlers + SSE 解析 + 模型解析
+├── openai.go / responses.go    # OpenAI 兼容端点
+├── testdata/protocol/1.1.34/   # frozen synthetic fixtures + manifest hashes
 ├── docs/
 │   ├── oauth.md
 │   └── inference-protocol.md
-├── examples/
-│   ├── claude-settings.json
-│   └── codex-config.toml
+├── examples/                   # 客户端脱敏配置示例
 ├── tools/
-│   ├── wasm_harness.py
-│   └── requirements.txt
-├── LICENSE                     # AGPL-3.0（项目原创代码/文档）
-├── NOTICE                      # 第三方组件和商标说明
+│   ├── wasm_harness.py         # external-oracle launcher
+│   └── wasm_oracle/            # 独立 Go/wazero analysis submodule
+├── LICENSE                     # AGPL-3.0
+├── NOTICE                      # 外部 oracle 与商标边界
 └── README.md
 ```
 
@@ -404,4 +454,4 @@ qodercli2api/
 
 ## 10. 许可证
 
-除 `NOTICE` 中单独列出的第三方 WASM 外，本项目采用 [GNU Affero General Public License v3.0](LICENSE)。通过网络向用户提供修改版服务时，AGPL-3.0 要求向这些用户提供对应源码。
+本仓库采用 [GNU Affero General Public License v3.0](LICENSE)。通过网络向用户提供修改版服务时，AGPL-3.0 要求向这些用户提供对应源码。运维方自行提供的外部 oracle 不属于本仓库；其授权边界见 `NOTICE`。

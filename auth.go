@@ -12,19 +12,20 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
 )
 
 const (
-	prodClientID    = "e883ade2-e6e3-4d6d-adf7-f92ceff5fdcb"
-	nonProdClientID = "e93fe488-5778-4c35-a6fc-0f54ed7b3139"
-	defaultOpenapi  = "https://openapi.qoder.sh"
-	defaultInfer    = "https://api2.qoder.sh"
-	defaultBase     = "https://qoder.com"
-	refreshSkewSec  = 3600
-	cliVersion      = "1.1.5"
+	prodClientID                = "e883ade2-e6e3-4d6d-adf7-f92ceff5fdcb"
+	nonProdClientID             = "e93fe488-5778-4c35-a6fc-0f54ed7b3139"
+	defaultOpenapi              = "https://openapi.qoder.sh"
+	defaultInfer                = "https://api2.qoder.sh"
+	defaultBase                 = "https://qoder.com"
+	refreshSkewSec              = 3600
+	defaultRefreshCommitTimeout = 30 * time.Second
 )
 
 type userInfo struct {
@@ -50,20 +51,35 @@ type userInfo struct {
 }
 
 type authManager struct {
-	mu          sync.Mutex
-	wasm        *wasmAuth
-	authFile    string
-	machineID   string
-	openapiBase string
-	inferBase   string
-	webBase     string
-	httpc       *http.Client
-	ui          *userInfo
-	ctx         uint32
-	logf        func(string, ...any)
+	mu       sync.Mutex
+	protocol *protocolServices
+
+	ctxMu     sync.RWMutex
+	protoCtx  protocolContext
+	closed    bool
+	closeOnce sync.Once
+	closeErr  error
+
+	authFile        string
+	machineID       string
+	openapiBase     string
+	inferBase       string
+	webBase         string
+	httpc           *http.Client
+	ui              *userInfo
+	credentialDirty bool
+	commitTimeout   time.Duration
+	logf            func(string, ...any)
 }
 
-func newAuthManager(w *wasmAuth, authDir, openapiBase, inferBase, webBase string, logf func(string, ...any)) (*authManager, error) {
+func newAuthManager(services *protocolServices, authDir, openapiBase, inferBase, webBase string, logf func(string, ...any)) (*authManager, error) {
+	if services == nil || services.credentials == nil || services.runtimeFields == nil || services.contextFactory == nil {
+		return nil, newProtocolError(
+			protocolInvalidInput,
+			"Protocol services are unavailable",
+			fmt.Errorf("auth manager requires credentials, runtime fields, and context factory capabilities"),
+		)
+	}
 	mid, err := loadOrCreateMachineID(authDir)
 	if err != nil {
 		return nil, err
@@ -77,11 +93,22 @@ func newAuthManager(w *wasmAuth, authDir, openapiBase, inferBase, webBase string
 	if webBase == "" {
 		webBase = defaultBase
 	}
-	return &authManager{
-		wasm: w, authFile: filepath.Join(authDir, "user"), machineID: mid,
+	if logf == nil {
+		logf = func(string, ...any) {}
+	}
+	manager := &authManager{
+		protocol: services, authFile: filepath.Join(authDir, "user"), machineID: mid,
 		openapiBase: openapiBase, inferBase: inferBase, webBase: webBase,
 		httpc: &http.Client{Timeout: 30 * time.Second}, logf: logf,
-	}, nil
+	}
+	return manager, nil
+}
+
+func machineCredentialKey(machineID string) string {
+	if len(machineID) > 16 {
+		return machineID[:16]
+	}
+	return machineID
 }
 
 func loadOrCreateMachineID(dir string) (string, error) {
@@ -109,11 +136,123 @@ func newUUID() string {
 	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
-func (a *authManager) loggedIn() bool { return a.ui != nil && a.ui.SecurityOAuthToken != "" }
+func authManagerClosedError() error {
+	return newProtocolError(
+		protocolContextClosed,
+		"Qoder protocol context is closed",
+		fmt.Errorf("auth manager is closed"),
+	)
+}
 
-func (a *authManager) load() error {
+func (a *authManager) closedStateError() error {
+	a.ctxMu.RLock()
+	defer a.ctxMu.RUnlock()
+	if a.closed {
+		return authManagerClosedError()
+	}
+	return nil
+}
+
+func (a *authManager) loggedIn() bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	return a.closedStateError() == nil && a.ui != nil && a.ui.SecurityOAuthToken != ""
+}
+
+func (a *authManager) safeLogf(format string, args ...any) {
+	if a.logf != nil {
+		a.logf(format, args...)
+	}
+}
+
+func (a *authManager) replaceContext(next protocolContext) error {
+	if next == nil {
+		return newProtocolError(
+			protocolAuthUnavailable,
+			"Authentication is unavailable",
+			fmt.Errorf("replacement protocol context is nil"),
+		)
+	}
+
+	a.ctxMu.Lock()
+	if a.closed {
+		a.ctxMu.Unlock()
+		if err := next.Close(); err != nil {
+			a.safeLogf("close rejected protocol context failed")
+		}
+		return authManagerClosedError()
+	}
+	old := a.protoCtx
+	a.protoCtx = next
+	a.ctxMu.Unlock()
+
+	if old != nil {
+		if err := old.Close(); err != nil {
+			a.safeLogf("close replaced protocol context failed")
+		}
+	}
+	return nil
+}
+
+func (a *authManager) prepareWithCurrentContext(ctx context.Context, input inferRequestInput) (*preparedRequest, error) {
+	a.ctxMu.RLock()
+	defer a.ctxMu.RUnlock()
+	if a.closed {
+		return nil, authManagerClosedError()
+	}
+	if a.protoCtx == nil {
+		return nil, newProtocolError(
+			protocolAuthUnavailable,
+			"Authentication is unavailable",
+			fmt.Errorf("protocol context is unavailable"),
+		)
+	}
+	return a.protoCtx.PrepareInferRequest(ctx, input)
+}
+
+func (a *authManager) PrepareInferRequest(ctx context.Context, input inferRequestInput) (*preparedRequest, error) {
+	if err := a.closedStateError(); err != nil {
+		return nil, err
+	}
+	if err := a.ensureFresh(ctx); err != nil {
+		if protocolErrorKindOf(err) == protocolContextClosed {
+			return nil, err
+		}
+		return nil, newProtocolError(
+			protocolAuthUnavailable,
+			"Authentication is unavailable",
+			fmt.Errorf("refresh authentication: %w", protocolInternalError(err)),
+		)
+	}
+	return a.prepareWithCurrentContext(ctx, input)
+}
+
+func (a *authManager) Close() error {
+	a.closeOnce.Do(func() {
+		a.mu.Lock()
+		persistErr := a.persistDirtyCredentialLocked(context.Background())
+		a.ctxMu.Lock()
+		a.closed = true
+		current := a.protoCtx
+		a.protoCtx = nil
+		a.ctxMu.Unlock()
+		a.mu.Unlock()
+
+		var contextErr error
+		if current != nil {
+			contextErr = current.Close()
+		}
+		a.closeErr = mergeProtocolErrors(persistErr, contextErr)
+	})
+	return a.closeErr
+}
+
+func (a *authManager) load(ctx context.Context) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if err := a.closedStateError(); err != nil {
+		return err
+	}
 	b, err := os.ReadFile(a.authFile)
 	if err != nil {
 		return err
@@ -123,11 +262,7 @@ func (a *authManager) load() error {
 	if strings.HasPrefix(s, "{") {
 		plain = []byte(s)
 	} else {
-		key := a.machineID
-		if len(key) > 16 {
-			key = key[:16]
-		}
-		dec, err := a.wasm.credentialDecrypt(s, key)
+		dec, err := a.protocol.credentials.Decrypt(ctx, s, machineCredentialKey(a.machineID))
 		if err != nil {
 			return fmt.Errorf("decrypt %s: %w", a.authFile, err)
 		}
@@ -138,93 +273,316 @@ func (a *authManager) load() error {
 		return err
 	}
 	a.ui = &ui
-	return a.rebuildContextLocked()
+	a.credentialDirty = false
+	return a.rebuildContextLocked(ctx)
 }
 
-func (a *authManager) save() error {
+func credentialPersistenceError(action string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return newProtocolError(
+		protocolBackendFailure,
+		"Authentication state could not be saved",
+		fmt.Errorf("%s: %w", action, protocolInternalError(err)),
+	)
+}
+
+type stagedCredential struct {
+	tempPath  string
+	finalPath string
+	published bool
+}
+
+func (s *stagedCredential) discard() {
+	if s == nil || s.published || s.tempPath == "" {
+		return
+	}
+	_ = os.Remove(s.tempPath)
+}
+
+func (s *stagedCredential) publish() error {
+	if s == nil || s.tempPath == "" || s.finalPath == "" {
+		return fmt.Errorf("staged credential is incomplete")
+	}
+	if err := os.Rename(s.tempPath, s.finalPath); err != nil {
+		return err
+	}
+	s.published = true
+	return nil
+}
+
+func (a *authManager) stageCredentialForUserLocked(ctx context.Context, ui *userInfo) (*stagedCredential, error) {
+	if ui == nil {
+		return nil, nil
+	}
+	if a.protocol == nil || a.protocol.credentials == nil {
+		return nil, newProtocolError(
+			protocolAuthUnavailable,
+			"Authentication is unavailable",
+			fmt.Errorf("credential codec is unavailable"),
+		)
+	}
+	plain, err := json.Marshal(ui)
+	if err != nil {
+		return nil, err
+	}
+	enc, err := a.protocol.credentials.Encrypt(ctx, string(plain), machineCredentialKey(a.machineID))
+	if err != nil {
+		return nil, err
+	}
+	dir := filepath.Dir(a.authFile)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, err
+	}
+	temp, err := os.CreateTemp(dir, ".user-*")
+	if err != nil {
+		return nil, err
+	}
+	staged := &stagedCredential{tempPath: temp.Name(), finalPath: a.authFile}
+	succeeded := false
+	defer func() {
+		_ = temp.Close()
+		if !succeeded {
+			staged.discard()
+		}
+	}()
+	if err := temp.Chmod(0o600); err != nil {
+		return nil, err
+	}
+	written, err := io.Copy(temp, strings.NewReader(enc))
+	if err != nil {
+		return nil, err
+	}
+	if written != int64(len(enc)) {
+		return nil, io.ErrShortWrite
+	}
+	if err := temp.Sync(); err != nil {
+		return nil, err
+	}
+	if err := temp.Close(); err != nil {
+		return nil, err
+	}
+	succeeded = true
+	return staged, nil
+}
+
+func (a *authManager) saveLocked(ctx context.Context) error {
+	if err := a.closedStateError(); err != nil {
+		return err
+	}
 	if a.ui == nil {
 		return nil
 	}
-	plain, err := json.Marshal(a.ui)
+	a.credentialDirty = true
+	staged, err := a.stageCredentialForUserLocked(ctx, a.ui)
 	if err != nil {
 		return err
 	}
-	key := a.machineID
-	if len(key) > 16 {
-		key = key[:16]
-	}
-	enc, err := a.wasm.credentialEncrypt(string(plain), key)
-	if err != nil {
+	defer staged.discard()
+	if err := staged.publish(); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(a.authFile), 0o755); err != nil {
-		return err
-	}
-	tmp := a.authFile + ".tmp"
-	if err := os.WriteFile(tmp, []byte(enc), 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, a.authFile)
+	a.credentialDirty = false
+	return nil
 }
 
-func (a *authManager) runtimeFieldsInput() string {
-	m := map[string]any{
-		"uid":                a.ui.UID,
-		"organization_id":    a.ui.OrgID,
-		"organization_tags":  a.ui.OrgTags,
-		"data_policy_agreed": a.ui.DataPolicyAgreed,
+func (a *authManager) detachedCommitContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	timeout := a.commitTimeout
+	if timeout <= 0 {
+		timeout = defaultRefreshCommitTimeout
 	}
-	b, _ := json.Marshal(m)
-	return string(b)
+	return context.WithTimeout(context.WithoutCancel(ctx), timeout)
 }
 
-func (a *authManager) authUserInfoJSON() string {
-	m := map[string]any{
-		"uid":                a.ui.UID,
-		"encrypt_user_info":  a.ui.EncryptUserInfo,
-		"key":                a.ui.Key,
-		"organization_id":    a.ui.OrgID,
-		"organization_tags":  a.ui.OrgTags,
-		"data_policy_agreed": a.ui.DataPolicyAgreed,
+func (a *authManager) persistDirtyCredentialLocked(ctx context.Context) error {
+	if !a.credentialDirty {
+		return nil
 	}
-	b, _ := json.Marshal(m)
-	return string(b)
+	persistCtx, cancel := a.detachedCommitContext(ctx)
+	defer cancel()
+	if err := a.saveLocked(persistCtx); err != nil {
+		return credentialPersistenceError("persist pending credentials", err)
+	}
+	return nil
 }
 
-func sceneJSON() string {
-	return `{"client_type":"5","business_product":"cli","business_type":"agent","scene":"assistant"}`
+func (a *authManager) save(ctx context.Context) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.saveLocked(ctx)
 }
 
-func (a *authManager) rebuildContextLocked() error {
-	if a.ui.EncryptUserInfo == "" || a.ui.Key == "" {
-		out, err := a.wasm.genRuntimeAuthFields(a.runtimeFieldsInput())
+func cloneUserInfo(ui *userInfo) *userInfo {
+	if ui == nil {
+		return nil
+	}
+	cloned := *ui
+	cloned.OrgTags = slices.Clone(ui.OrgTags)
+	return &cloned
+}
+
+func normalizedOrganizationTags(tags []string) []string {
+	normalized := make([]string, len(tags))
+	copy(normalized, tags)
+	return normalized
+}
+
+func (a *authManager) runtimeFieldInputForLocked(ui *userInfo) runtimeFieldInput {
+	if ui == nil {
+		return runtimeFieldInput{}
+	}
+	return runtimeFieldInput{
+		UID:              ui.UID,
+		OrganizationID:   ui.OrgID,
+		OrganizationTags: normalizedOrganizationTags(ui.OrgTags),
+		DataPolicyAgreed: ui.DataPolicyAgreed,
+	}
+}
+
+func (a *authManager) runtimeFieldInputLocked() runtimeFieldInput {
+	return a.runtimeFieldInputForLocked(a.ui)
+}
+
+func (a *authManager) contextConfigForLocked(ui *userInfo) protocolContextConfig {
+	if ui == nil {
+		return protocolContextConfig{MachineID: a.machineID, Version: qoderProtocolVersion, Scene: defaultProtocolScene()}
+	}
+	return protocolContextConfig{
+		MachineID: a.machineID,
+		Version:   qoderProtocolVersion,
+		User: protocolUserInfo{
+			UID:              ui.UID,
+			EncryptUserInfo:  ui.EncryptUserInfo,
+			Key:              ui.Key,
+			OrganizationID:   ui.OrgID,
+			OrganizationTags: normalizedOrganizationTags(ui.OrgTags),
+			DataPolicyAgreed: ui.DataPolicyAgreed,
+		},
+		Scene: defaultProtocolScene(),
+	}
+}
+
+func (a *authManager) contextConfigLocked() protocolContextConfig {
+	return a.contextConfigForLocked(a.ui)
+}
+
+func (a *authManager) buildContextForUserLocked(ctx context.Context, ui *userInfo) (protocolContext, error) {
+	if err := a.closedStateError(); err != nil {
+		return nil, err
+	}
+	if ui == nil {
+		return nil, newProtocolError(
+			protocolAuthUnavailable,
+			"Authentication is unavailable",
+			fmt.Errorf("user credentials are unavailable"),
+		)
+	}
+	if a.protocol == nil || a.protocol.runtimeFields == nil || a.protocol.contextFactory == nil {
+		return nil, newProtocolError(
+			protocolAuthUnavailable,
+			"Authentication is unavailable",
+			fmt.Errorf("required protocol capabilities are unavailable"),
+		)
+	}
+	if ui.EncryptUserInfo == "" || ui.Key == "" {
+		fields, err := a.protocol.runtimeFields.Generate(ctx, a.runtimeFieldInputForLocked(ui))
 		if err != nil {
-			return fmt.Errorf("generate_runtime_auth_fields: %w", err)
+			return nil, err
 		}
-		var rf struct {
-			EncryptUserInfo string `json:"encrypt_user_info"`
-			Key             string `json:"key"`
+		if fields.EncryptUserInfo == "" || fields.Key == "" {
+			return nil, newProtocolError(
+				protocolAuthUnavailable,
+				"Authentication is unavailable",
+				fmt.Errorf("generated runtime authentication fields are incomplete"),
+			)
 		}
-		if err := json.Unmarshal([]byte(out), &rf); err != nil {
-			return err
+		ui.EncryptUserInfo, ui.Key = fields.EncryptUserInfo, fields.Key
+		if ui == a.ui {
+			a.credentialDirty = true
 		}
-		a.ui.EncryptUserInfo, a.ui.Key = rf.EncryptUserInfo, rf.Key
 	}
-	ctx, err := a.wasm.newContext(a.machineID, cliVersion, a.authUserInfoJSON(), sceneJSON())
+	return a.protocol.contextFactory.New(ctx, a.contextConfigForLocked(ui))
+}
+
+func (a *authManager) rebuildContextLocked(ctx context.Context) error {
+	next, err := a.buildContextForUserLocked(ctx, a.ui)
 	if err != nil {
 		return err
 	}
-	a.ctx = ctx
+	return a.replaceContext(next)
+}
+
+func (a *authManager) closeRejectedLoginContext(candidate protocolContext) {
+	if candidate == nil {
+		return
+	}
+	if err := candidate.Close(); err != nil {
+		a.safeLogf("close rejected login protocol context failed")
+	}
+}
+
+func (a *authManager) commitLoginCandidateLocked(ctx context.Context, candidate *userInfo) error {
+	next, err := a.buildContextForUserLocked(ctx, candidate)
+	if err != nil {
+		a.closeRejectedLoginContext(next)
+		return err
+	}
+	if next == nil {
+		return newProtocolError(
+			protocolAuthUnavailable,
+			"Authentication is unavailable",
+			fmt.Errorf("candidate protocol context is unavailable"),
+		)
+	}
+	if err := a.closedStateError(); err != nil {
+		a.closeRejectedLoginContext(next)
+		return err
+	}
+	staged, err := a.stageCredentialForUserLocked(ctx, candidate)
+	if err != nil {
+		a.closeRejectedLoginContext(next)
+		return err
+	}
+	defer staged.discard()
+
+	a.ctxMu.Lock()
+	if a.closed {
+		a.ctxMu.Unlock()
+		a.closeRejectedLoginContext(next)
+		return authManagerClosedError()
+	}
+	if err := staged.publish(); err != nil {
+		a.ctxMu.Unlock()
+		a.closeRejectedLoginContext(next)
+		return err
+	}
+	old := a.protoCtx
+	a.protoCtx = next
+	a.ui = candidate
+	a.credentialDirty = false
+	a.ctxMu.Unlock()
+
+	if old != nil {
+		if err := old.Close(); err != nil {
+			a.safeLogf("close replaced protocol context failed")
+		}
+	}
 	return nil
 }
 
 func (a *authManager) inferEndpoint() string { return a.inferBase }
-func (a *authManager) wasmCtx() uint32       { return a.ctx }
 
 // ensureFresh refreshes the device token when it expires within refreshSkewSec.
 func (a *authManager) ensureFresh(ctx context.Context) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if err := a.closedStateError(); err != nil {
+		return err
+	}
+	if err := a.persistDirtyCredentialLocked(ctx); err != nil {
+		return err
+	}
 	if a.ui == nil {
 		return fmt.Errorf("not authenticated")
 	}
@@ -241,10 +599,41 @@ func (a *authManager) ensureFresh(ctx context.Context) error {
 func (a *authManager) forceRefresh(ctx context.Context) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if err := a.closedStateError(); err != nil {
+		return err
+	}
+	if err := a.persistDirtyCredentialLocked(ctx); err != nil {
+		return err
+	}
 	return a.refreshLocked(ctx)
 }
 
+func (a *authManager) preserveRefreshRotationAndSaveLocked(ctx context.Context, refreshToken string, refreshExpiry int64) error {
+	if a.ui == nil {
+		return nil
+	}
+	refreshChanged := refreshToken != "" && a.ui.RefreshToken != refreshToken
+	expiryChanged := refreshExpiry != 0 && a.ui.RefreshTokenExpireTime != refreshExpiry
+	if !refreshChanged && !expiryChanged {
+		return nil
+	}
+	a.credentialDirty = true
+	if refreshChanged {
+		a.ui.RefreshToken = refreshToken
+	}
+	if expiryChanged {
+		a.ui.RefreshTokenExpireTime = refreshExpiry
+	}
+	return a.persistDirtyCredentialLocked(ctx)
+}
+
 func (a *authManager) refreshLocked(ctx context.Context) error {
+	if err := a.closedStateError(); err != nil {
+		return err
+	}
+	if a.ui == nil {
+		return fmt.Errorf("not authenticated")
+	}
 	if a.ui.RefreshToken == "" {
 		return fmt.Errorf("no refresh_token")
 	}
@@ -255,7 +644,7 @@ func (a *authManager) refreshLocked(ctx context.Context) error {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", "qoder/"+cliVersion)
+	req.Header.Set("User-Agent", qoderUserAgent())
 	resp, err := a.httpc.Do(req)
 	if err != nil {
 		return err
@@ -266,13 +655,13 @@ func (a *authManager) refreshLocked(ctx context.Context) error {
 		return fmt.Errorf("deviceToken/refresh status %d: %s", resp.StatusCode, truncate(string(raw), 200))
 	}
 	var r struct {
-		DeviceToken   string `json:"device_token"`
-		Token         string `json:"token"`
-		RefreshToken  string `json:"refresh_token"`
-		ExpiresAt     string `json:"expires_at"`
-		ExpiresIn     int64  `json:"expires_in"`
-		RefreshExpAt  string `json:"refresh_token_expires_at"`
-		RefreshExpIn  int64  `json:"refresh_token_expires_in"`
+		DeviceToken  string `json:"device_token"`
+		Token        string `json:"token"`
+		RefreshToken string `json:"refresh_token"`
+		ExpiresAt    string `json:"expires_at"`
+		ExpiresIn    int64  `json:"expires_in"`
+		RefreshExpAt string `json:"refresh_token_expires_at"`
+		RefreshExpIn int64  `json:"refresh_token_expires_in"`
 	}
 	if err := json.Unmarshal(raw, &r); err != nil {
 		return err
@@ -284,31 +673,38 @@ func (a *authManager) refreshLocked(ctx context.Context) error {
 	if tok == "" {
 		return fmt.Errorf("refresh response missing token")
 	}
-	a.ui.SecurityOAuthToken, a.ui.AccessToken = tok, tok
+	commitCtx, cancelCommit := a.detachedCommitContext(ctx)
+	defer cancelCommit()
+
+	candidate := cloneUserInfo(a.ui)
+	candidate.SecurityOAuthToken, candidate.AccessToken = tok, tok
 	if r.RefreshToken != "" {
-		a.ui.RefreshToken = r.RefreshToken
+		candidate.RefreshToken = r.RefreshToken
 	}
-	a.ui.ExpireTime = parseExpiry(r.ExpiresAt, r.ExpiresIn)
-	if v := parseExpiry(r.RefreshExpAt, r.RefreshExpIn); v != 0 {
-		a.ui.RefreshTokenExpireTime = v
+	candidate.ExpireTime = parseExpiry(r.ExpiresAt, r.ExpiresIn)
+	refreshExpiry := parseExpiry(r.RefreshExpAt, r.RefreshExpIn)
+	if refreshExpiry != 0 {
+		candidate.RefreshTokenExpireTime = refreshExpiry
 	}
-	out, err := a.wasm.genRuntimeAuthFields(a.runtimeFieldsInput())
-	if err == nil {
-		var rf struct {
-			EncryptUserInfo string `json:"encrypt_user_info"`
-			Key             string `json:"key"`
-		}
-		if json.Unmarshal([]byte(out), &rf) == nil && rf.Key != "" {
-			a.ui.EncryptUserInfo, a.ui.Key = rf.EncryptUserInfo, rf.Key
+	if a.protocol != nil && a.protocol.runtimeFields != nil {
+		fields, fieldErr := a.protocol.runtimeFields.Generate(commitCtx, a.runtimeFieldInputForLocked(candidate))
+		if fieldErr == nil && fields.EncryptUserInfo != "" && fields.Key != "" {
+			candidate.EncryptUserInfo, candidate.Key = fields.EncryptUserInfo, fields.Key
 		}
 	}
-	if err := a.rebuildContextLocked(); err != nil {
+	next, err := a.buildContextForUserLocked(commitCtx, candidate)
+	if err != nil {
+		return mergeProtocolErrors(err, a.preserveRefreshRotationAndSaveLocked(commitCtx, r.RefreshToken, refreshExpiry))
+	}
+	if err := a.replaceContext(next); err != nil {
+		return mergeProtocolErrors(err, a.preserveRefreshRotationAndSaveLocked(commitCtx, r.RefreshToken, refreshExpiry))
+	}
+	a.credentialDirty = true
+	a.ui = candidate
+	if err := a.persistDirtyCredentialLocked(commitCtx); err != nil {
 		return err
 	}
-	if err := a.save(); err != nil {
-		a.logf("save credential: %v", err)
-	}
-	a.logf("device token refreshed, new expiry %d", a.ui.ExpireTime)
+	a.safeLogf("device token refreshed, new expiry %d", a.ui.ExpireTime)
 	return nil
 }
 
@@ -348,6 +744,9 @@ func randBytes(n int) []byte {
 
 // deviceLogin runs the full device authorization flow and persists credentials.
 func (a *authManager) deviceLogin(ctx context.Context, out io.Writer) error {
+	if err := a.closedStateError(); err != nil {
+		return err
+	}
 	verifier, challenge := pkcePair()
 	nonce := newUUID()
 	authURL := fmt.Sprintf("%s/device/selectAccounts?challenge=%s&challenge_method=S256&nonce=%s&machine_id=%s&client_id=%s",
@@ -382,14 +781,14 @@ func (a *authManager) deviceLogin(ctx context.Context, out io.Writer) error {
 			return fmt.Errorf("poll status %d: %s", resp.StatusCode, truncate(string(raw), 200))
 		}
 		var dr struct {
-			Token                string `json:"token"`
-			RefreshToken         string `json:"refresh_token"`
-			ExpiresAt            string `json:"expires_at"`
-			ExpiresIn            int64  `json:"expires_in"`
-			RefreshExpiresAt     string `json:"refresh_token_expires_at"`
-			RefreshExpiresIn     int64  `json:"refresh_token_expires_in"`
-			UserID               string `json:"user_id"`
-			UserName             string `json:"user_name"`
+			Token            string `json:"token"`
+			RefreshToken     string `json:"refresh_token"`
+			ExpiresAt        string `json:"expires_at"`
+			ExpiresIn        int64  `json:"expires_in"`
+			RefreshExpiresAt string `json:"refresh_token_expires_at"`
+			RefreshExpiresIn int64  `json:"refresh_token_expires_in"`
+			UserID           string `json:"user_id"`
+			UserName         string `json:"user_name"`
 		}
 		if err := json.Unmarshal(raw, &dr); err != nil {
 			return err
@@ -397,74 +796,118 @@ func (a *authManager) deviceLogin(ctx context.Context, out io.Writer) error {
 		if dr.Token == "" {
 			return fmt.Errorf("poll response missing token: %s", truncate(string(raw), 200))
 		}
-		a.mu.Lock()
-		a.ui = &userInfo{
+		candidate := &userInfo{
 			UID: dr.UserID, Name: dr.UserName,
 			SecurityOAuthToken: dr.Token, AccessToken: dr.Token,
 			RefreshToken: dr.RefreshToken, ExpireTime: parseExpiry(dr.ExpiresAt, dr.ExpiresIn),
 			RefreshTokenExpireTime: parseExpiry(dr.RefreshExpiresAt, dr.RefreshExpiresIn),
-			LoginMethod: "browser", LoginTimestamp: time.Now().Unix(),
+			LoginMethod:            "browser", LoginTimestamp: time.Now().Unix(),
 		}
-		if err := a.rebuildContextLocked(); err != nil {
+		a.mu.Lock()
+		if err := a.closedStateError(); err != nil {
+			a.mu.Unlock()
+			return err
+		}
+		if err := a.commitLoginCandidateLocked(ctx, candidate); err != nil {
 			a.mu.Unlock()
 			return err
 		}
 		a.mu.Unlock()
-		if err := a.save(); err != nil {
-			return fmt.Errorf("save: %w", err)
-		}
-		// best-effort profile enrichment
-		a.fetchUserInfo(ctx)
-		fmt.Fprintf(out, "Login successful. uid=%s name=%s\n", a.ui.UID, a.ui.Name)
+		// best-effort profile enrichment for this exact committed candidate.
+		a.fetchUserInfo(ctx, candidate)
+		a.mu.Lock()
+		successUID, successName := candidate.UID, candidate.Name
+		a.mu.Unlock()
+		fmt.Fprintf(out, "Login successful. uid=%s name=%s\n", successUID, successName)
 		return nil
 	}
 	return fmt.Errorf("device flow timed out after 5 minutes")
 }
 
-func (a *authManager) fetchUserInfo(ctx context.Context) {
-	a.mu.Lock()
-	tok := a.ui.SecurityOAuthToken
-	a.mu.Unlock()
-	req, _ := http.NewRequestWithContext(ctx, "GET", a.openapiBase+"/api/v1/userinfo", nil)
+type authUserInfoProfile struct {
+	UID     string   `json:"uid"`
+	Name    string   `json:"name"`
+	Email   string   `json:"email"`
+	OrgID   string   `json:"organization_id"`
+	OrgName string   `json:"organization_name"`
+	OrgTags []string `json:"organization_tags"`
+}
+
+func (a *authManager) requestUserInfo(ctx context.Context, token string) (authUserInfoProfile, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", a.openapiBase+"/api/v1/userinfo", nil)
+	if err != nil {
+		return authUserInfoProfile{}, err
+	}
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Authorization", "Bearer "+tok)
-	req.Header.Set("User-Agent", "qoder/"+cliVersion)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("User-Agent", qoderUserAgent())
 	resp, err := a.httpc.Do(req)
-	if err != nil || resp.StatusCode != 200 {
-		if resp != nil {
-			resp.Body.Close()
-		}
+	if err != nil {
+		return authUserInfoProfile{}, err
+	}
+	if resp == nil {
+		return authUserInfoProfile{}, fmt.Errorf("userinfo response is unavailable")
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return authUserInfoProfile{}, fmt.Errorf("userinfo status %d", resp.StatusCode)
+	}
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return authUserInfoProfile{}, err
+	}
+	var profile authUserInfoProfile
+	if err := json.Unmarshal(raw, &profile); err != nil {
+		return authUserInfoProfile{}, err
+	}
+	return profile, nil
+}
+
+func applyAuthUserInfoProfile(ui *userInfo, profile authUserInfoProfile) {
+	if ui == nil {
 		return
 	}
-	raw, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
-	var p struct {
-		UID     string   `json:"uid"`
-		Name    string   `json:"name"`
-		Email   string   `json:"email"`
-		OrgID   string   `json:"organization_id"`
-		OrgName string   `json:"organization_name"`
-		OrgTags []string `json:"organization_tags"`
+	if profile.UID != "" {
+		ui.UID = profile.UID
 	}
-	if json.Unmarshal(raw, &p) != nil {
+	if profile.Email != "" {
+		ui.Email = profile.Email
+	}
+	if profile.Name != "" {
+		ui.Name = profile.Name
+	}
+	if profile.OrgID != "" {
+		ui.OrgID, ui.OrgName = profile.OrgID, profile.OrgName
+	}
+	if len(profile.OrgTags) > 0 {
+		ui.OrgTags = slices.Clone(profile.OrgTags)
+	}
+}
+
+func (a *authManager) fetchUserInfo(ctx context.Context, target *userInfo) {
+	if target == nil {
+		return
+	}
+	a.mu.Lock()
+	if a.closedStateError() != nil || a.ui != target {
+		a.mu.Unlock()
+		return
+	}
+	tok := target.SecurityOAuthToken
+	a.mu.Unlock()
+	profile, err := a.requestUserInfo(ctx, tok)
+	if err != nil {
 		return
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if p.Email != "" {
-		a.ui.Email = p.Email
+	if a.closedStateError() != nil || a.ui != target {
+		return
 	}
-	if p.Name != "" {
-		a.ui.Name = p.Name
-	}
-	if p.OrgID != "" {
-		a.ui.OrgID, a.ui.OrgName = p.OrgID, p.OrgName
-	}
-	if len(p.OrgTags) > 0 {
-		a.ui.OrgTags = p.OrgTags
-	}
-	a.rebuildContextLocked()
-	a.save()
+	a.credentialDirty = true
+	applyAuthUserInfoProfile(target, profile)
+	_ = a.rebuildContextLocked(ctx)
+	_ = a.saveLocked(ctx)
 }
 
 func truncate(s string, n int) string {

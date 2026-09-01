@@ -18,7 +18,6 @@ import (
 
 type server struct {
 	auth     *authManager
-	wasm     *wasmAuth
 	sk       string
 	models   *modelResolver
 	httpc    *http.Client
@@ -396,20 +395,20 @@ func (s *server) callUpstream(ctx context.Context, body []byte, mc *modelConfig,
 }
 
 func (s *server) doUpstream(ctx context.Context, body []byte, mc *modelConfig) (*http.Response, error) {
-	if err := s.auth.ensureFresh(ctx); err != nil {
-		return nil, fmt.Errorf("auth: %w", err)
-	}
-	ir, err := s.wasm.prepareInferRequest(s.auth.wasmCtx(), s.auth.inferEndpoint(), string(body), mc.Key, mc.Source)
+	ir, err := s.auth.PrepareInferRequest(ctx, inferRequestInput{
+		Endpoint:    s.auth.inferEndpoint(),
+		Body:        body,
+		ModelKey:    mc.Key,
+		ModelSource: mc.Source,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("prepareInferRequest: %w", err)
 	}
-	req, err := http.NewRequestWithContext(ctx, "POST", ir.URL, strings.NewReader(ir.Body))
+	req, err := http.NewRequestWithContext(ctx, "POST", ir.URL, bytes.NewReader(ir.Body))
 	if err != nil {
 		return nil, err
 	}
-	for k, v := range ir.Headers {
-		req.Header.Set(k, v)
-	}
+	req.Header = ir.Header.Clone()
 	return s.httpc.Do(req)
 }
 

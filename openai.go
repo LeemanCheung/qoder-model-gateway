@@ -16,17 +16,21 @@ import (
 // (e.g. ultimate) are routed through a node that rejects requests without it
 // with `[FAIL]node:oa_qwen-plus... Execution failed: null`.
 func businessInfo(msgs []upMessage) map[string]any {
+	return businessInfoWithSources(msgs, newUUID, func() int64 { return time.Now().UnixMilli() })
+}
+
+func businessInfoWithSources(msgs []upMessage, newID func() string, nowMillis func() int64) map[string]any {
 	name := lastUserText(msgs)
 	if len(name) > 10 {
 		name = name[:10]
 	}
 	return map[string]any{
 		"product":  "cli",
-		"version":  cliVersion,
+		"version":  qoderProtocolVersion,
 		"type":     "agent",
-		"id":       newUUID(),
+		"id":       newID(),
 		"name":     name,
-		"begin_at": time.Now().UnixMilli(),
+		"begin_at": nowMillis(),
 		"stage":    "start",
 	}
 }
@@ -53,6 +57,10 @@ func lastUserText(msgs []upMessage) string {
 }
 
 func remoteChatAskBody(system string, msgs []upMessage, tools []map[string]any, params map[string]any, mc *modelConfig, sessionID, requestID string) ([]byte, error) {
+	return remoteChatAskBodyWithSources(system, msgs, tools, params, mc, sessionID, requestID, newUUID, func() int64 { return time.Now().UnixMilli() })
+}
+
+func remoteChatAskBodyWithSources(system string, msgs []upMessage, tools []map[string]any, params map[string]any, mc *modelConfig, sessionID, requestID string, newID func() string, nowMillis func() int64) ([]byte, error) {
 	if tools == nil {
 		tools = []map[string]any{}
 	}
@@ -63,7 +71,7 @@ func remoteChatAskBody(system string, msgs []upMessage, tools []map[string]any, 
 		msgs = append([]upMessage{{Role: "system", Content: system}}, msgs...)
 	}
 	body := map[string]any{
-		"business":         businessInfo(msgs),
+		"business":         businessInfoWithSources(msgs, newID, nowMillis),
 		"request_id":       requestID,
 		"request_set_id":   requestID,
 		"chat_record_id":   requestID,
