@@ -52,6 +52,53 @@ func TestLoadCatalogExplicitFileBypassesDecryptor(t *testing.T) {
 	}
 }
 
+func TestLoadCatalogKeepsChatWhenBYOKGroupIsMalformed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "catalog.json")
+	data := []byte(`{"chat":[{"key":"cached","display_name":"Cached"}],"byok_teams":{}}`)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if modelByKey(loadCatalog(context.Background(), nil, "", "", path, t.Logf), "cached") == nil {
+		t.Fatal("malformed byok_teams discarded the valid chat catalog")
+	}
+}
+
+func TestLoadCatalogMergesBYOKGroups(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "catalog.json")
+	data := []byte(`{
+		"chat":[{"key":"cached-chat","display_name":"Cached Chat"}],
+		"byok_enterprise":[{"key":"enterprise-byok","display_name":"Enterprise BYOK","source":"organization"}],
+		"byok_teams":[null,{"display_name":"Invalid"},{"key":"team-byok","display_name":"Team BYOK","source":"byokTeams"}]
+	}`)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	resolver := newModelResolver(loadCatalog(context.Background(), nil, "", "", path, t.Logf), nil, "", "")
+	for _, want := range []struct {
+		key, name, source string
+	}{
+		{key: "enterprise-byok", name: "Enterprise BYOK", source: "organization"},
+		{key: "team-byok", name: "Team BYOK", source: "byokTeams"},
+	} {
+		model, ok := resolver.byKey[want.key]
+		if !ok || !model.Enable || model.Source != want.source {
+			t.Errorf("catalog model %q = %+v, want enabled source %q", want.key, model, want.source)
+			continue
+		}
+		if got := resolver.publicID(model); got != want.name {
+			t.Errorf("publicID(%q) = %q, want %q", want.key, got, want.name)
+		}
+		if got := resolver.resolve(want.name); got.Key != want.key || got.Source != want.source {
+			t.Errorf("resolve(%q) = %+v, want key %q source %q", want.name, got, want.key, want.source)
+		}
+	}
+	if _, ok := resolver.byKey[""]; ok {
+		t.Fatal("invalid BYOK entry produced an empty model key")
+	}
+}
+
 func TestLoadCatalogUsesModelCacheDecryptor(t *testing.T) {
 	root := t.TempDir()
 	authFile := filepath.Join(root, ".auth", "user")

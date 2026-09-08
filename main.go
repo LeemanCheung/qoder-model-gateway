@@ -114,14 +114,30 @@ func loadCatalog(ctx context.Context, decryptor modelCacheDecryptor, authFile, u
 	}
 	if len(raw) > 0 {
 		var cat struct {
-			Chat []*modelConfig `json:"chat"`
+			Chat           json.RawMessage `json:"chat"`
+			BYOKEnterprise json.RawMessage `json:"byok_enterprise"`
+			BYOKTeams      json.RawMessage `json:"byok_teams"`
 		}
-		if json.Unmarshal(raw, &cat) == nil && len(cat.Chat) > 0 {
+		if json.Unmarshal(raw, &cat) == nil {
+			var models []*modelConfig
+			for _, group := range []json.RawMessage{cat.Chat, cat.BYOKEnterprise, cat.BYOKTeams} {
+				var entries []*modelConfig
+				if len(group) == 0 || json.Unmarshal(group, &entries) != nil {
+					continue
+				}
+				models = append(models, entries...)
+			}
+			if len(models) == 0 {
+				return catalog
+			}
 			merged := map[string]*modelConfig{}
 			for _, mc := range catalog {
 				merged[mc.Key] = mc
 			}
-			for _, mc := range cat.Chat {
+			for _, mc := range models {
+				if mc == nil || strings.TrimSpace(mc.Key) == "" {
+					continue
+				}
 				if mc.Format == "" {
 					mc.Format = "openai"
 				}
