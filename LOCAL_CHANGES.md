@@ -8,6 +8,7 @@ This repository changes the upstream project into a model-only, local Qoder CN g
 - Local mode permits only IPv4 loopback binding, a local gateway key, verified Qoder CN HTTPS endpoints, read-only Qoder authentication, bounded request bodies, and bounded concurrent inference.
 - Read-only authentication consumes an existing official Qoder CN login without device login, PAT login, network refresh, token rotation, credential creation, or credential writes. Invalid and changed files fail closed.
 - The account model cache is read in memory. Disabled models are excluded, aliases are labeled `qoder-anthropic/<model>`, and unknown model names fail with `404` rather than selecting a fallback.
+- The manager reads Qoder Desktop's `chat_model_preferences` table in read-only mode and gives each account model its valid selected context window. A missing or invalid preference falls back to the catalogue default, never to the largest advertised window. Effective, maximum, and supported context windows are exposed in model discovery and the effective window becomes upstream `parameters.context_length`.
 - The local endpoint reports model-only health and sanitizes upstream errors.
 - `scripts/qoder-gateway.mjs` adds an optional, dependency-free manager for local build/start/stop/model discovery and safe Claude Code routing setup.
 

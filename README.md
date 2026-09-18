@@ -28,7 +28,7 @@ The gateway exposes three local endpoints:
 
 - Model inference only. Tool calls are returned to the calling harness; Qoder does not execute local tools.
 - Only models in the local account catalogue are accepted. Unknown model names return `404`; there is no silent fallback.
-- It reads existing Qoder CN authentication and model-cache files in memory. It does not create a machine ID, refresh a token, rotate a token, log in, or write those files.
+- It reads existing Qoder CN authentication and model-cache files in memory. When launched through the included manager, it also reads the Qoder Desktop `chat_model_preferences` context-window values without modifying the database. It does not create a machine ID, refresh a token, rotate a token, log in, or write those files.
 - It does not include Qoder CLI, a credential, a model cache, a captured request, or a user configuration file.
 - The production binary forces loopback binding, a local gateway key, read-only authentication, fixed Qoder CN HTTPS endpoints, no verbose dumps, an 8 MiB body limit, and four concurrent inference requests.
 - It is not affiliated with, endorsed by, or sponsored by Qoder or Alibaba. Use only an account you are authorized to use and comply with the applicable service terms and law.
@@ -39,7 +39,7 @@ The gateway is for one user's local desktop. It is not a network service, shared
 
 - Go `1.25+` to build the local gateway.
 - A current Qoder CN CLI login and its local model cache. Log in through the official Qoder CN client or CLI before starting this gateway.
-- Node.js `20.18+` only when using the included Claude Code configuration helper. The Go gateway itself has no Node dependency.
+- Node.js `22.5+` only when using the included Claude Code configuration helper. The Go gateway itself has no Node dependency.
 
 The default authentication directory is `~/.qoder-cn/.auth`. The gateway finds the matching encrypted model cache from that login and does not persist a plaintext copy.
 
@@ -67,6 +67,14 @@ claude
 ```
 
 Then run `/model` inside Claude Code and select a `Qoder CN · …` model. The helper defaults to `Kimi-K3` and maps Claude's fast model family to `Qwen3.8-Flash` when those models are available. The selected model is sent as `qoder-anthropic/<account-model-name>`; use the menu or `/v1/models` output rather than guessing names.
+
+The gateway sends each model's current Qoder Desktop preference as the upstream `context_length`, and `/v1/models` exposes `context_window`, `max_context_tokens`, and `available_context_windows`. Claude Code 2.1.237 applies `CLAUDE_CODE_MAX_CONTEXT_TOKENS` once when a process starts, so it cannot change arbitrary 200K/400K/1M limits inside an already running `/model` session. `claude-enable` sets that variable from the currently selected default model. After changing the persistent model in `/model`, run the following before starting a new session:
+
+```powershell
+node scripts/qoder-gateway.mjs claude-sync
+```
+
+This keeps Claude's auto-compaction budget aligned with the selected model. The manager also writes per-model metadata to Claude's gateway discovery cache for newer Claude versions that consume it.
 
 The native `claude` executable is not replaced. Its configured `apiKeyHelper` starts the local gateway when needed and supplies its local key directly to Claude, without printing that key in a terminal.
 

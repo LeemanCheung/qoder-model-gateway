@@ -167,11 +167,6 @@ func loadCatalog(ctx context.Context, decryptor modelCacheDecryptor, authFile, u
 					mc.Source = "system"
 				}
 				mc.Enable = true
-				for _, tier := range mc.ContextConfig {
-					if tier.TokenCount > mc.MaxInputTokens {
-						mc.MaxInputTokens = tier.TokenCount
-					}
-				}
 				merged[mc.Key] = mc
 			}
 			catalog = catalog[:0]
@@ -181,6 +176,7 @@ func loadCatalog(ctx context.Context, decryptor modelCacheDecryptor, authFile, u
 			logf("catalog merged: %d models", len(catalog))
 		}
 	}
+	applyContextPreferences(catalog, nil)
 	return catalog
 }
 

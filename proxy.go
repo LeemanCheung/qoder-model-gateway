@@ -153,10 +153,13 @@ func (r *modelResolver) resolve(clientModel string) *modelConfig {
 	}
 	if nativeLockedDown() {
 		mc, ok := r.modelByIdentifier(name)
-		if !ok || !mc.Enable || (want1M && mc.MaxInputTokens < 900000) {
+		if !ok || !mc.Enable || (want1M && mc.maximumContextWindow() < 900000) {
 			return nil
 		}
 		copy := *mc
+		if want1M {
+			copy.EffectiveContextWindow = copy.maximumContextWindow()
+		}
 		return &copy
 	}
 	key := ""
@@ -175,8 +178,8 @@ func (r *modelResolver) resolve(clientModel string) *modelConfig {
 		}
 	}
 	mc := r.byKeyOrSynthetic(key)
-	if want1M && mc.MaxInputTokens < 900000 {
-		if big := r.byKeyOrSynthetic(r.oneM); big.MaxInputTokens >= 900000 {
+	if want1M && mc.maximumContextWindow() < 900000 {
+		if big := r.byKeyOrSynthetic(r.oneM); big.maximumContextWindow() >= 900000 {
 			return big
 		}
 	}
@@ -917,15 +920,18 @@ func (s *server) handleModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	type modelListItem struct {
-		ID          string `json:"id"`
-		Name        string `json:"name"`
-		DisplayName string `json:"display_name"`
-		QoderKey    string `json:"qoder_key"`
-		Object      string `json:"object"`
-		Created     int    `json:"created"`
-		OwnedBy     string `json:"owned_by"`
-		Type        string `json:"type"`
-		MaxTokens   int    `json:"max_tokens"`
+		ID                      string `json:"id"`
+		Name                    string `json:"name"`
+		DisplayName             string `json:"display_name"`
+		QoderKey                string `json:"qoder_key"`
+		Object                  string `json:"object"`
+		Created                 int    `json:"created"`
+		OwnedBy                 string `json:"owned_by"`
+		Type                    string `json:"type"`
+		MaxTokens               int    `json:"max_tokens"`
+		ContextWindow           int    `json:"context_window,omitempty"`
+		MaxContextTokens        int    `json:"max_context_tokens,omitempty"`
+		AvailableContextWindows []int  `json:"available_context_windows,omitempty"`
 	}
 	list := make([]modelListItem, 0, len(s.models.byKey))
 	for _, mc := range s.models.byKey {
@@ -934,15 +940,18 @@ func (s *server) handleModels(w http.ResponseWriter, r *http.Request) {
 			name = mc.Key
 		}
 		list = append(list, modelListItem{
-			ID:          s.models.publicID(mc),
-			Name:        name,
-			DisplayName: name,
-			QoderKey:    mc.Key,
-			Object:      "model",
-			Created:     0,
-			OwnedBy:     "qoder",
-			Type:        "model",
-			MaxTokens:   mc.MaxInputTokens,
+			ID:                      s.models.publicID(mc),
+			Name:                    name,
+			DisplayName:             name,
+			QoderKey:                mc.Key,
+			Object:                  "model",
+			Created:                 0,
+			OwnedBy:                 "qoder",
+			Type:                    "model",
+			MaxTokens:               mc.contextWindow(),
+			ContextWindow:           mc.contextWindow(),
+			MaxContextTokens:        mc.maximumContextWindow(),
+			AvailableContextWindows: mc.supportedContextWindows(),
 		})
 		if nativeLockedDown() {
 			list[len(list)-1].ID = "qoder-anthropic/" + name

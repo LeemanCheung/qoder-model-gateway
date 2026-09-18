@@ -33,21 +33,22 @@ func (s *trackedString) Set(value string) error {
 }
 
 type appConfig struct {
-	addr            string
-	sk              string
-	authDir         string
-	inferEndpoint   string
-	openapiEndpoint string
-	webEndpoint     string
-	modelMapJSON    string
-	defaultModel    string
-	oneMModel       string
-	catalogPath     string
-	dumpDir         string
-	login           bool
-	loginPAT        string
-	readOnlyAuth    bool
-	verbose         bool
+	addr             string
+	sk               string
+	authDir          string
+	inferEndpoint    string
+	openapiEndpoint  string
+	webEndpoint      string
+	modelMapJSON     string
+	defaultModel     string
+	oneMModel        string
+	catalogPath      string
+	dumpDir          string
+	login            bool
+	loginPAT         string
+	readOnlyAuth     bool
+	contextPrefsJSON string
+	verbose          bool
 }
 
 func lookupEnvOr(lookupEnv func(string) (string, bool), key, fallback string) string {
@@ -83,6 +84,7 @@ func parseAppConfig(args []string, lookupEnv func(string) (string, bool), output
 	fs.BoolVar(&cfg.login, "login", false, "run device flow login then exit")
 	fs.StringVar(&cfg.loginPAT, "login-pat", "", "login with a personal access token then exit")
 	fs.BoolVar(&cfg.readOnlyAuth, "read-only-auth", false, "reuse existing CLI authentication without login, refresh, or credential writes")
+	fs.StringVar(&cfg.contextPrefsJSON, "context-preferences", lookupEnvOr(lookupEnv, "QODER2API_CONTEXT_PREFERENCES", ""), "JSON map of local Qoder model key to selected context window")
 	fs.BoolVar(&cfg.verbose, "v", lookupEnvOr(lookupEnv, "QODER2API_LOG", "") == "debug", "verbose logging")
 
 	if err := fs.Parse(args); err != nil {
@@ -375,6 +377,11 @@ func run(parent context.Context, cfg appConfig, deps appDeps, stdout io.Writer, 
 	}
 	auth.mu.Unlock()
 	catalog := loadCatalog(ctx, services.modelCache, authFile, uid, cfg.catalogPath, debugf)
+	contextPreferences, contextPreferencesErr := parseContextPreferences(cfg.contextPrefsJSON)
+	if contextPreferencesErr != nil {
+		return contextPreferencesErr
+	}
+	applyContextPreferences(catalog, contextPreferences)
 	resolver := newModelResolver(catalog, mapping, cfg.defaultModel, cfg.oneMModel)
 
 	if cfg.sk == "" {

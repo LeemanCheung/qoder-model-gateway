@@ -633,11 +633,14 @@ func TestModelResolverUsesOnlyUnambiguousDisplayNames(t *testing.T) {
 type modelListResponse struct {
 	Object string `json:"object"`
 	Data   []struct {
-		ID          string `json:"id"`
-		Name        string `json:"name"`
-		DisplayName string `json:"display_name"`
-		QoderKey    string `json:"qoder_key"`
-		MaxTokens   int    `json:"max_tokens"`
+		ID                      string `json:"id"`
+		Name                    string `json:"name"`
+		DisplayName             string `json:"display_name"`
+		QoderKey                string `json:"qoder_key"`
+		MaxTokens               int    `json:"max_tokens"`
+		ContextWindow           int    `json:"context_window"`
+		MaxContextTokens        int    `json:"max_context_tokens"`
+		AvailableContextWindows []int  `json:"available_context_windows"`
 	} `json:"data"`
 }
 
@@ -681,6 +684,9 @@ func TestHandleModelsReturnsFriendlyStableIDs(t *testing.T) {
 	}
 	if qwen.MaxTokens != 1_000_000 {
 		t.Errorf("Qwen max_tokens = %d, want 1000000", qwen.MaxTokens)
+	}
+	if qwen.ContextWindow != 1_000_000 || qwen.MaxContextTokens != 1_000_000 || !reflect.DeepEqual(qwen.AvailableContextWindows, []int(nil)) {
+		t.Errorf("Qwen context metadata = %#v, want default/max=1000000 and no configured tiers", qwen)
 	}
 }
 

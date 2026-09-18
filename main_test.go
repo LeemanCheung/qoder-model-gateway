@@ -117,7 +117,7 @@ func TestLoadCatalogUsesModelCacheDecryptor(t *testing.T) {
 	if decryptor.calls != 1 || decryptor.input != "encrypted-catalog" || decryptor.uid != uid {
 		t.Fatalf("Decrypt() = calls %d, input %q, uid %q", decryptor.calls, decryptor.input, decryptor.uid)
 	}
-	if model := modelByKey(catalog, "cached"); model == nil || model.MaxInputTokens != 321000 || !model.Enable {
+	if model := modelByKey(catalog, "cached"); model == nil || model.contextWindow() != 321000 || !model.Enable {
 		t.Fatalf("cached model = %#v, want merged cache model", model)
 	}
 	if modelByKey(catalog, "auto") == nil {
@@ -189,7 +189,7 @@ func TestLoadCatalogMergesNativeQMCV1Cache(t *testing.T) {
 	catalog := loadCatalog(context.Background(), nativeModelCacheDecryptor{}, authFile, uid, "", func(string, ...any) {})
 
 	model := modelByKey(catalog, "native-cached")
-	if model == nil || !model.Enable || model.Format != "openai" || model.Source != "system" || model.MaxInputTokens != 654321 {
+	if model == nil || !model.Enable || model.Format != "openai" || model.Source != "system" || model.contextWindow() != 654321 {
 		t.Fatal("native QMC catalog model was not merged with approved defaults")
 	}
 	if modelByKey(catalog, "auto") == nil {

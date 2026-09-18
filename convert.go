@@ -115,9 +115,17 @@ type modelConfig struct {
 	MaxInputTokens int     `json:"max_input_tokens,omitempty"`
 	URL            string  `json:"url,omitempty"`
 
-	ContextConfig map[string]struct {
-		TokenCount int `json:"token_count"`
-	} `json:"context_config,omitempty"`
+	ContextConfig map[string]contextTier `json:"context_config,omitempty"`
+
+	// EffectiveContextWindow is intentionally local-only. The catalogue's
+	// max_input_tokens belongs to the upstream model descriptor, whereas Qoder
+	// applies a selected context_length separately for each model.
+	EffectiveContextWindow int `json:"-"`
+}
+
+type contextTier struct {
+	TokenCount int  `json:"token_count"`
+	IsDefault  bool `json:"is_default,omitempty"`
 }
 
 // ---------- conversion ----------
@@ -388,8 +396,8 @@ func buildUpstreamBody(req *anthropicRequest, mc *modelConfig, sessionID, reques
 	}
 	ensureCacheMarker(msgs)
 	params := map[string]any{"max_tokens": req.MaxTokens}
-	if mc.MaxInputTokens > 0 {
-		params["context_length"] = mc.MaxInputTokens
+	if contextWindow := mc.contextWindow(); contextWindow > 0 {
+		params["context_length"] = contextWindow
 	}
 	if req.Thinking != nil {
 		switch req.Thinking.Type {

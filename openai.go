@@ -306,8 +306,8 @@ func (s *server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		maxTok = 32000
 	}
 	params := map[string]any{"max_tokens": maxTok}
-	if mc.MaxInputTokens > 0 {
-		params["context_length"] = mc.MaxInputTokens
+	if contextWindow := mc.contextWindow(); contextWindow > 0 {
+		params["context_length"] = contextWindow
 	}
 	if e := normalizeEffort(req.ReasoningEffort); e != "" {
 		params["reasoning_effort"] = e

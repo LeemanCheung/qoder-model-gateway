@@ -27,6 +27,32 @@ async function writeJson(file, value) {
   await fs.rename(temporary, file);
 }
 function processAlive(pid) { try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'EPERM'; } }
+
+export function contextPreferencesFromRows(rows) {
+  const preferences = {};
+  for (const row of rows) {
+    const key = typeof row?.model_key === 'string' ? row.model_key.trim() : '';
+    const window = Number(row?.context_window);
+    if (/^[A-Za-z0-9._-]{1,128}$/.test(key) && Number.isInteger(window) && window > 0 && window <= 2_000_000) preferences[key] = window;
+  }
+  return preferences;
+}
+
+async function readQoderContextPreferences() {
+  const database = process.env.QODER_DESKTOP_DB || path.join(process.env.APPDATA || '', 'com.qodercn.app.stable', 'main.sqlite');
+  if (!database || !await exists(database)) return {};
+  try {
+    const { DatabaseSync } = await import('node:sqlite');
+    const connection = new DatabaseSync(database, { readOnly: true });
+    try {
+      return contextPreferencesFromRows(connection.prepare('SELECT model_key, context_window FROM chat_model_preferences WHERE context_window IS NOT NULL').all());
+    } finally { connection.close(); }
+  } catch {
+    // Desktop settings are optional. An unavailable, locked, or older database
+    // must fall back to the account catalogue's declared default window.
+    return {};
+  }
+}
 async function withLock(action) {
   const lock = path.join(state, 'control.lock');
   await fs.mkdir(state, { recursive: true, mode: 0o700 });
@@ -77,9 +103,11 @@ async function serve() {
   const c = await config();
   if (!await exists(nativeBinary)) throw new Error('GATEWAY_BINARY_MISSING: run build first.');
   const instanceId = randomUUID();
+  const contextPreferences = await readQoderContextPreferences();
   const child = spawn(nativeBinary, [
     '-addr', `127.0.0.1:${c.port}`, '-auth-dir', c.authDir, '-read-only-auth',
     '-endpoint', 'https://gateway.qoder.com.cn', '-openapi-endpoint', 'https://openapi.qoder.com.cn', '-web-endpoint', 'https://qoder.cn',
+    '-context-preferences', JSON.stringify(contextPreferences),
   ], {
     cwd: repository, windowsHide: true, stdio: 'ignore',
     env: { ...process.env, QODER2API_SK: c.token, QODER2API_INSTANCE_ID: instanceId, QODER2API_LOG: '', QODER2API_DUMP_DIR: '', QODER2API_MODEL_MAP: '' },
@@ -126,16 +154,20 @@ async function models(c, live) {
   if (!response.ok) throw new Error('MODEL_DISCOVERY_FAILED');
   const value = await response.json();
   if (!Array.isArray(value.data) || !value.data.length || value.data.some(model => typeof model.id !== 'string' || !model.id.startsWith('qoder-anthropic/'))) throw new Error('MODEL_DISCOVERY_INVALID');
-  return value.data.map(({ id, display_name }) => ({ id, display_name }));
+  return value.data.map(model => ({ ...model }));
 }
 export function buildClaudeSettings(existing, { baseUrl, helper, models }) {
   const next = structuredClone(existing);
   next.env ??= {};
   for (const key of Object.keys(next.env)) if (/^ANTHROPIC_(?:API_KEY|AUTH_TOKEN|MODEL|CUSTOM_HEADERS|SMALL_FAST_MODEL|CUSTOM_MODEL_OPTION(?:_NAME|_DESCRIPTION)?)$|^CLAUDE_CODE_USE_|^CLAUDE_CODE_OAUTH_TOKEN$/.test(key)) delete next.env[key];
   const available = models.map(model => model.id);
+  const selected = typeof next.model === 'string' && available.includes(next.model) ? next.model.slice('qoder-anthropic/'.length) : null;
   const pick = name => available.includes(`qoder-anthropic/${name}`) ? name : models[0].id.slice('qoder-anthropic/'.length);
-  const primary = pick('Kimi-K3');
+  const primary = selected || pick('Kimi-K3');
   const fast = pick('Qwen3.8-Flash');
+  const primaryMetadata = models.find(model => model.id === `qoder-anthropic/${primary}`);
+  const contextWindow = Number.isInteger(primaryMetadata?.context_window) && primaryMetadata.context_window > 0 ? primaryMetadata.context_window : 200000;
+  const compactWindow = Math.max(160000, Math.floor(contextWindow * 0.8));
   const route = name => `qoder-anthropic/${name}`;
   Object.assign(next.env, {
     ANTHROPIC_BASE_URL: baseUrl,
@@ -144,13 +176,13 @@ export function buildClaudeSettings(existing, { baseUrl, helper, models }) {
     ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION: 'Local Qoder CN model-only gateway.',
     CLAUDE_CODE_SUBAGENT_MODEL: route(primary), CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: '1',
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '0', DISABLE_TELEMETRY: '1', DISABLE_ERROR_REPORTING: '1', ENABLE_TOOL_SEARCH: 'false', CLAUDE_CODE_ATTRIBUTION_HEADER: '0',
-    CLAUDE_CODE_MAX_CONTEXT_TOKENS: '200000', CLAUDE_CODE_AUTO_COMPACT_WINDOW: '160000',
+    CLAUDE_CODE_MAX_CONTEXT_TOKENS: String(contextWindow), CLAUDE_CODE_AUTO_COMPACT_WINDOW: String(compactWindow),
     NO_PROXY: [...new Set(`${next.env.NO_PROXY || ''},127.0.0.1,localhost,::1`.split(',').filter(Boolean))].join(','),
   });
   next.model = route(primary);
   next.availableModels = available;
   next.apiKeyHelper = helper;
-  return next;
+  return { settings: next, contextWindow };
 }
 async function claudeEnable() {
   const { c, live } = await ensureRunning();
@@ -161,7 +193,8 @@ async function claudeEnable() {
   const before = await exists(settings) ? await fs.readFile(settings) : Buffer.from('{}\n');
   const existing = JSON.parse(before.toString('utf8').replace(/^\uFEFF/, ''));
   const helper = `"${process.execPath.replaceAll('\\', '/')}" "${entry.replaceAll('\\', '/')}" credentials`;
-  const next = buildClaudeSettings(existing, { baseUrl: live.url, helper, models: available });
+  const configured = buildClaudeSettings(existing, { baseUrl: live.url, helper, models: available });
+  const next = configured.settings;
   const backup = path.join(state, 'backups', `claude-${Date.now()}`);
   await fs.mkdir(backup, { recursive: true, mode: 0o700 });
   await fs.writeFile(path.join(backup, 'settings.json'), before, { mode: 0o600 });
@@ -170,7 +203,7 @@ async function claudeEnable() {
   await writeJson(settings, next);
   await writeJson(cache, { baseUrl: live.url, fetchedAt: Date.now(), models: available });
   await writeJson(path.join(state, 'claude-configuration.json'), { configuredAt: new Date().toISOString(), backup, settings, modelCount: available.length });
-  output({ status: 'configured', command: 'claude', picker: '/model', models: available.length, backup });
+  output({ status: 'configured', command: 'claude', picker: '/model', models: available.length, contextWindow: configured.contextWindow, backup });
 }
 async function stop() {
   const c = await config();
@@ -192,8 +225,8 @@ async function main() {
   if (action === 'stop') return stop();
   if (action === 'status') { const c = await config(); const live = await current(c); return output(live ? { status: 'ready', ...live } : { status: 'stopped', url: `http://127.0.0.1:${c.port}` }); }
   if (action === 'models') { const { c, live } = await ensureRunning(); return output({ mode: 'model-only', models: await models(c, live) }); }
-  if (action === 'claude-enable') return claudeEnable();
+  if (action === 'claude-enable' || action === 'claude-sync') return claudeEnable();
   if (action === 'credentials') { const { c } = await ensureRunning(); process.stdout.write(c.token); return; }
-  throw new Error('UNKNOWN_COMMAND: build, start, stop, status, models, or claude-enable');
+  throw new Error('UNKNOWN_COMMAND: build, start, stop, status, models, claude-enable, or claude-sync');
 }
 if (path.resolve(process.argv[1] || '') === entry) main().catch(error => { console.error(JSON.stringify({ status: 'error', code: error.message })); process.exitCode = 1; });
