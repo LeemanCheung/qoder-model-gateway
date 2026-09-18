@@ -264,6 +264,9 @@ func oaiToUpstream(msgs []oaiMessage) (string, []upMessage) {
 }
 
 func writeOAIError(w http.ResponseWriter, status int, errType, code, msg string) {
+	if errType == "api_error" {
+		msg = nativePublicError(msg)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(map[string]any{
@@ -291,6 +294,10 @@ func (s *server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	mc := s.models.resolve(req.Model)
+	if mc == nil {
+		writeOAIError(w, 404, "not_found_error", "", "The exact requested Qoder model is unavailable")
+		return
+	}
 	maxTok := req.MaxTokens
 	if req.MaxCompletionTokens > 0 {
 		maxTok = req.MaxCompletionTokens

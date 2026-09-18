@@ -19,6 +19,12 @@ import (
 )
 
 func main() {
+	// This repository is a local, model-only gateway distribution.  Lock the
+	// production binary to the loopback/read-only profile before any flag or
+	// environment parsing.  Unit tests exercise lower-level functions directly.
+	if err := os.Setenv("QODER2API_NATIVE_LOCKDOWN", "1"); err != nil {
+		log.Fatal(err)
+	}
 	cfg, err := parseAppConfig(os.Args[1:], os.LookupEnv, os.Stderr)
 	if errors.Is(err, flag.ErrHelp) {
 		return
@@ -26,15 +32,25 @@ func main() {
 	if err != nil {
 		os.Exit(2)
 	}
+	if err := validateLocalNativeConfig(cfg); err != nil {
+		log.Fatal(err)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	nativeShutdown = stop
 	debugf := func(format string, args ...any) {
 		if cfg.verbose {
 			log.Printf(format, args...)
 		}
 	}
-	always := func(format string, args ...any) { log.Printf(format, args...) }
+	always := func(format string, args ...any) {
+		if nativeLockedDown() {
+			log.Printf("qoder native event: %s", format)
+			return
+		}
+		log.Printf(format, args...)
+	}
 	if err := run(ctx, cfg, defaultAppDeps(), os.Stdout, debugf, always); err != nil {
 		log.Fatal(err)
 	}
@@ -85,6 +101,9 @@ func catalogDecryptErrorDetail(err error) string {
 // by a plaintext catalog file or the CLI's encrypted model cache.
 func loadCatalog(ctx context.Context, decryptor modelCacheDecryptor, authFile, uid, catalogPath string, logf func(string, ...any)) []*modelConfig {
 	catalog := builtinCatalog()
+	if nativeLockedDown() {
+		catalog = nil
+	}
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
@@ -136,6 +155,9 @@ func loadCatalog(ctx context.Context, decryptor modelCacheDecryptor, authFile, u
 			}
 			for _, mc := range models {
 				if mc == nil || strings.TrimSpace(mc.Key) == "" {
+					continue
+				}
+				if nativeLockedDown() && !mc.Enable {
 					continue
 				}
 				if mc.Format == "" {

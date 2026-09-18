@@ -538,6 +538,10 @@ func (s *server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	mc := s.models.resolve(req.Model)
+	if mc == nil {
+		writeOAIError(w, 404, "not_found_error", "", "The exact requested Qoder model is unavailable")
+		return
+	}
 	maxTok := req.MaxOutputTokens
 	if maxTok == 0 {
 		maxTok = 32000

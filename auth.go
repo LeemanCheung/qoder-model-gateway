@@ -62,6 +62,7 @@ type authManager struct {
 	closeErr  error
 
 	authFile                 string
+	readOnly                 bool
 	machineID                string
 	openapiBase              string
 	inferBase                string
@@ -75,6 +76,14 @@ type authManager struct {
 }
 
 func newAuthManager(services *protocolServices, authDir, openapiBase, inferBase, webBase string, logf func(string, ...any)) (*authManager, error) {
+	return newAuthManagerWithMode(services, authDir, openapiBase, inferBase, webBase, logf, false)
+}
+
+func newReadOnlyAuthManager(services *protocolServices, authDir, openapiBase, inferBase, webBase string, logf func(string, ...any)) (*authManager, error) {
+	return newAuthManagerWithMode(services, authDir, openapiBase, inferBase, webBase, logf, true)
+}
+
+func newAuthManagerWithMode(services *protocolServices, authDir, openapiBase, inferBase, webBase string, logf func(string, ...any), readOnly bool) (*authManager, error) {
 	if services == nil || services.credentials == nil || services.runtimeFields == nil || services.contextFactory == nil {
 		return nil, newProtocolError(
 			protocolInvalidInput,
@@ -82,7 +91,13 @@ func newAuthManager(services *protocolServices, authDir, openapiBase, inferBase,
 			fmt.Errorf("auth manager requires credentials, runtime fields, and context factory capabilities"),
 		)
 	}
-	mid, err := loadOrCreateMachineID(authDir)
+	var mid string
+	var err error
+	if readOnly {
+		mid, err = readExistingAuthFiles(authDir)
+	} else {
+		mid, err = loadOrCreateMachineID(authDir)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -100,10 +115,43 @@ func newAuthManager(services *protocolServices, authDir, openapiBase, inferBase,
 	}
 	manager := &authManager{
 		protocol: services, authFile: filepath.Join(authDir, "user"), machineID: mid,
+		readOnly:    readOnly,
 		openapiBase: openapiBase, inferBase: inferBase, webBase: webBase,
 		httpc: &http.Client{Timeout: 30 * time.Second}, logf: logf,
 	}
+	if readOnly {
+		manager.httpc.Transport = readOnlyAuthTransport{}
+	}
 	return manager, nil
+}
+
+// This client is used only by authentication operations. Inference uses the
+// server's separate HTTP client, so no authentication network call can rotate
+// or enrich the shared CLI login even if a future caller bypasses a guard.
+type readOnlyAuthTransport struct{}
+
+func (readOnlyAuthTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, readOnlyAuthError()
+}
+
+// A shared CLI login belongs to the CLI. Read-only integrations must never
+// create, replace, repair, or refresh its files, including a missing machine ID.
+func readExistingAuthFiles(authDir string) (string, error) {
+	var machineID string
+	for _, name := range []string{"user", "machine_id"} {
+		data, err := os.ReadFile(filepath.Join(authDir, name))
+		if err != nil || len(bytes.TrimSpace(data)) == 0 {
+			return "", fmt.Errorf("read-only authentication requires an existing readable, non-empty %s file; sign in with the official Qoder CLI", name)
+		}
+		if name == "machine_id" {
+			machineID = strings.TrimSpace(string(data))
+		}
+	}
+	return machineID, nil
+}
+
+func readOnlyAuthError() error {
+	return fmt.Errorf("authentication is read-only; use the official Qoder CLI to log in or refresh credentials")
 }
 
 func machineCredentialKey(machineID string) string {
@@ -315,6 +363,9 @@ func (s *stagedCredential) publish() error {
 }
 
 func (a *authManager) stageCredentialForUserLocked(ctx context.Context, ui *userInfo) (*stagedCredential, error) {
+	if a.readOnly {
+		return nil, readOnlyAuthError()
+	}
 	if ui == nil {
 		return nil, nil
 	}
@@ -370,6 +421,9 @@ func (a *authManager) stageCredentialForUserLocked(ctx context.Context, ui *user
 }
 
 func (a *authManager) markCredentialDirtyLocked() {
+	if a.readOnly {
+		return
+	}
 	a.credentialDirty = true
 	a.credentialPersistRetryAt = time.Time{}
 }
@@ -382,6 +436,9 @@ func (a *authManager) clearCredentialDirtyLocked() {
 func (a *authManager) saveLocked(ctx context.Context) error {
 	if err := a.closedStateError(); err != nil {
 		return err
+	}
+	if a.readOnly {
+		return readOnlyAuthError()
 	}
 	if a.ui == nil {
 		return nil
@@ -408,6 +465,9 @@ func (a *authManager) detachedCommitContext(ctx context.Context) (context.Contex
 }
 
 func (a *authManager) persistDirtyCredentialLocked(ctx context.Context) error {
+	if a.readOnly {
+		return nil
+	}
 	if !a.credentialDirty {
 		return nil
 	}
@@ -420,6 +480,9 @@ func (a *authManager) persistDirtyCredentialLocked(ctx context.Context) error {
 }
 
 func (a *authManager) persistDirtyCredentialBestEffortLocked(ctx context.Context, action string, force bool) {
+	if a.readOnly {
+		return
+	}
 	if !a.credentialDirty {
 		return
 	}
@@ -549,6 +612,9 @@ func (a *authManager) closeRejectedLoginContext(candidate protocolContext) {
 }
 
 func (a *authManager) commitLoginCandidateLocked(ctx context.Context, candidate *userInfo) error {
+	if a.readOnly {
+		return readOnlyAuthError()
+	}
 	next, err := a.buildContextForUserLocked(ctx, candidate)
 	if err != nil {
 		a.closeRejectedLoginContext(next)
@@ -601,6 +667,9 @@ func (a *authManager) inferEndpoint() string { return a.inferBase }
 
 // ensureFresh refreshes the device token when it expires within refreshSkewSec.
 func (a *authManager) ensureFresh(ctx context.Context) error {
+	if a.readOnly {
+		return a.load(ctx)
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if err := a.closedStateError(); err != nil {
@@ -621,6 +690,9 @@ func (a *authManager) ensureFresh(ctx context.Context) error {
 }
 
 func (a *authManager) forceRefresh(ctx context.Context) error {
+	if a.readOnly {
+		return a.load(ctx)
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if err := a.closedStateError(); err != nil {
@@ -631,6 +703,9 @@ func (a *authManager) forceRefresh(ctx context.Context) error {
 }
 
 func (a *authManager) preserveRefreshRotationAndSaveLocked(ctx context.Context, refreshToken string, refreshExpiry int64) error {
+	if a.readOnly {
+		return readOnlyAuthError()
+	}
 	if a.ui == nil {
 		return nil
 	}
@@ -650,6 +725,9 @@ func (a *authManager) preserveRefreshRotationAndSaveLocked(ctx context.Context, 
 }
 
 func (a *authManager) refreshLocked(ctx context.Context) error {
+	if a.readOnly {
+		return readOnlyAuthError()
+	}
 	if err := a.closedStateError(); err != nil {
 		return err
 	}
@@ -764,6 +842,9 @@ func randBytes(n int) []byte {
 
 // deviceLogin runs the full device authorization flow and persists credentials.
 func (a *authManager) deviceLogin(ctx context.Context, out io.Writer) error {
+	if a.readOnly {
+		return readOnlyAuthError()
+	}
 	if err := a.closedStateError(); err != nil {
 		return err
 	}

@@ -1,4 +1,5 @@
 # Build outputs and downloaded executables
+/bin/
 /qodercli2api
 /qodercli2api-*
 /qodercli-*
@@ -17,11 +18,6 @@
 
 # Reverse-engineering workspace is local-only
 /re/
-
-# Only the two reviewed public documents are tracked
-/docs/*
-!/docs/oauth.md
-!/docs/inference-protocol.md
 
 # Python/local tool state
 __pycache__/

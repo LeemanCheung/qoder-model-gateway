@@ -146,10 +146,18 @@ func (r *modelResolver) publicID(mc *modelConfig) string {
 // A "[1m]" suffix on the model name requests a 1M-context upstream model.
 func (r *modelResolver) resolve(clientModel string) *modelConfig {
 	want1M := false
-	name := clientModel
+	name := strings.TrimPrefix(clientModel, "qoder-anthropic/")
 	if strings.HasSuffix(name, "[1m]") {
 		want1M = true
 		name = strings.TrimSuffix(name, "[1m]")
+	}
+	if nativeLockedDown() {
+		mc, ok := r.modelByIdentifier(name)
+		if !ok || !mc.Enable || (want1M && mc.MaxInputTokens < 900000) {
+			return nil
+		}
+		copy := *mc
+		return &copy
 	}
 	key := ""
 	if r.mapping != nil {
@@ -211,6 +219,9 @@ func (s *server) authOK(r *http.Request) bool {
 }
 
 func writeAnthropicError(w http.ResponseWriter, status int, errType, msg string) {
+	if errType == "api_error" {
+		msg = nativePublicError(msg)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(map[string]any{
@@ -242,6 +253,10 @@ func (s *server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		areq.MaxTokens = 32000
 	}
 	mc := s.models.resolve(areq.Model)
+	if mc == nil {
+		writeAnthropicError(w, 404, "not_found_error", "The exact requested Qoder model is unavailable")
+		return
+	}
 	requestID := newUUID()
 	sessionID := s.sessionFor(areq.Model)
 	body, err := buildUpstreamBody(&areq, mc, sessionID, requestID)
@@ -416,6 +431,21 @@ func (s *server) doUpstream(ctx context.Context, body []byte, mc *modelConfig) (
 		return nil, err
 	}
 	req.Header = ir.Header.Clone()
+	if nativeLockedDown() {
+		if req.URL.Scheme != "https" || req.URL.Hostname() != "gateway.qoder.com.cn" {
+			return nil, fmt.Errorf("unapproved inference endpoint")
+		}
+		client := *s.httpc
+		client.Timeout = 180 * time.Second
+		client.CheckRedirect = func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }
+		resp, err := client.Do(req)
+		if resp != nil && resp.StatusCode != 200 {
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 8192))
+			_ = resp.Body.Close()
+			resp.Body = io.NopCloser(strings.NewReader(`{"error":"Qoder upstream rejected this request"}`))
+		}
+		return resp, err
+	}
 	return s.httpc.Do(req)
 }
 
@@ -687,6 +717,7 @@ func (s *server) streamAnthropic(w http.ResponseWriter, body io.Reader, areq *an
 			if msg == "" {
 				msg = fmt.Sprintf("upstream error status %d", env.StatusCodeValue)
 			}
+			msg = nativePublicError(msg)
 			st.emit("error", map[string]any{
 				"type":  "error",
 				"error": map[string]string{"type": "api_error", "message": msg},
@@ -702,6 +733,7 @@ func (s *server) streamAnthropic(w http.ResponseWriter, body io.Reader, areq *an
 			return true
 		}
 		if chunk.Error != nil && chunk.Error.Message != "" {
+			chunk.Error.Message = nativePublicError(chunk.Error.Message)
 			st.emit("error", map[string]any{
 				"type":  "error",
 				"error": map[string]string{"type": "api_error", "message": chunk.Error.Message},
@@ -912,6 +944,10 @@ func (s *server) handleModels(w http.ResponseWriter, r *http.Request) {
 			Type:        "model",
 			MaxTokens:   mc.MaxInputTokens,
 		})
+		if nativeLockedDown() {
+			list[len(list)-1].ID = "qoder-anthropic/" + name
+			list[len(list)-1].DisplayName = "Qoder CN · " + name
+		}
 	}
 	sort.Slice(list, func(i, j int) bool { return list[i].ID < list[j].ID })
 	w.Header().Set("Content-Type", "application/json")
@@ -972,11 +1008,28 @@ func (s *server) routes() *http.ServeMux {
 	mux.HandleFunc("GET /v1/models", s.handleModels)
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		if nativeLockedDown() {
+			json.NewEncoder(w).Encode(map[string]any{"ok": true, "status": "ok", "authenticated": s.auth.loggedIn(), "service": "qoder-model-gateway", "mode": "model-only", "instanceId": os.Getenv("QODER2API_INSTANCE_ID")})
+			return
+		}
 		fmt.Fprintf(w, `{"ok":true,"authenticated":%v}`, s.auth.loggedIn())
+	})
+	mux.HandleFunc("POST /_qoder/shutdown", func(w http.ResponseWriter, r *http.Request) {
+		if !s.authOK(r) {
+			writeAnthropicError(w, 401, "authentication_error", "invalid local credential")
+			return
+		}
+		if nativeShutdown == nil {
+			http.Error(w, "shutdown unavailable", 503)
+			return
+		}
+		w.WriteHeader(202)
+		_, _ = w.Write([]byte(`{"status":"shutting_down"}`))
+		go func() { time.Sleep(50 * time.Millisecond); nativeShutdown() }()
 	})
 	return mux
 }
 
 func (s *server) handler() http.Handler {
-	return s.logMiddleware(s.routes())
+	return localNativeGuard(s.logMiddleware(s.routes()))
 }

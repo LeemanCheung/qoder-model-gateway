@@ -46,6 +46,7 @@ type appConfig struct {
 	dumpDir         string
 	login           bool
 	loginPAT        string
+	readOnlyAuth    bool
 	verbose         bool
 }
 
@@ -81,6 +82,7 @@ func parseAppConfig(args []string, lookupEnv func(string) (string, bool), output
 	fs.StringVar(&cfg.dumpDir, "dump-dir", lookupEnvOr(lookupEnv, "QODER2API_DUMP_DIR", ""), "when set, dump plaintext bodies of failing upstream requests here for debugging")
 	fs.BoolVar(&cfg.login, "login", false, "run device flow login then exit")
 	fs.StringVar(&cfg.loginPAT, "login-pat", "", "login with a personal access token then exit")
+	fs.BoolVar(&cfg.readOnlyAuth, "read-only-auth", false, "reuse existing CLI authentication without login, refresh, or credential writes")
 	fs.BoolVar(&cfg.verbose, "v", lookupEnvOr(lookupEnv, "QODER2API_LOG", "") == "debug", "verbose logging")
 
 	if err := fs.Parse(args); err != nil {
@@ -108,23 +110,25 @@ func (t realAppTicker) C() <-chan time.Time { return t.ticker.C }
 func (t realAppTicker) Stop()               { t.ticker.Stop() }
 
 type appDeps struct {
-	newProtocolServices func(protocolHostDeps) (*protocolServices, error)
-	newAuthManager      func(*protocolServices, string, string, string, string, func(string, ...any)) (*authManager, error)
-	deviceLogin         func(context.Context, *authManager, io.Writer) error
-	patLogin            func(context.Context, *authManager, string) error
-	loadCredentials     func(context.Context, *authManager) error
-	ensureFresh         func(context.Context, *authManager) error
-	newTicker           func(time.Duration) appTicker
-	serverHandler       func(*server) http.Handler
-	listenAndServe      func(*http.Server) error
-	shutdown            func(context.Context, *http.Server) error
-	closeServer         func(*http.Server) error
+	newProtocolServices    func(protocolHostDeps) (*protocolServices, error)
+	newAuthManager         func(*protocolServices, string, string, string, string, func(string, ...any)) (*authManager, error)
+	newReadOnlyAuthManager func(*protocolServices, string, string, string, string, func(string, ...any)) (*authManager, error)
+	deviceLogin            func(context.Context, *authManager, io.Writer) error
+	patLogin               func(context.Context, *authManager, string) error
+	loadCredentials        func(context.Context, *authManager) error
+	ensureFresh            func(context.Context, *authManager) error
+	newTicker              func(time.Duration) appTicker
+	serverHandler          func(*server) http.Handler
+	listenAndServe         func(*http.Server) error
+	shutdown               func(context.Context, *http.Server) error
+	closeServer            func(*http.Server) error
 }
 
 func defaultAppDeps() appDeps {
 	return appDeps{
-		newProtocolServices: newProtocolServices,
-		newAuthManager:      newAuthManager,
+		newProtocolServices:    newProtocolServices,
+		newAuthManager:         newAuthManager,
+		newReadOnlyAuthManager: newReadOnlyAuthManager,
 		deviceLogin: func(ctx context.Context, manager *authManager, output io.Writer) error {
 			return manager.deviceLogin(ctx, output)
 		},
@@ -160,6 +164,9 @@ func (deps appDeps) withDefaults() appDeps {
 	}
 	if deps.newAuthManager == nil {
 		deps.newAuthManager = defaults.newAuthManager
+	}
+	if deps.newReadOnlyAuthManager == nil {
+		deps.newReadOnlyAuthManager = defaults.newReadOnlyAuthManager
 	}
 	if deps.deviceLogin == nil {
 		deps.deviceLogin = defaults.deviceLogin
@@ -251,6 +258,14 @@ func run(parent context.Context, cfg appConfig, deps appDeps, stdout io.Writer, 
 		always = func(string, ...any) {}
 	}
 	deps = deps.withDefaults()
+	if cfg.readOnlyAuth {
+		if cfg.login || cfg.loginPAT != "" {
+			return readOnlyAuthError()
+		}
+		if _, checkErr := readExistingAuthFiles(cfg.authDir); checkErr != nil {
+			return checkErr
+		}
+	}
 
 	ctx, cancel := context.WithCancel(parent)
 	var wg sync.WaitGroup
@@ -287,10 +302,15 @@ func run(parent context.Context, cfg appConfig, deps appDeps, stdout io.Writer, 
 	if initErr != nil {
 		return fmt.Errorf("init protocol services: %w", initErr)
 	}
-	auth, initErr = deps.newAuthManager(services, cfg.authDir, cfg.openapiEndpoint, cfg.inferEndpoint, cfg.webEndpoint, always)
+	if cfg.readOnlyAuth {
+		auth, initErr = deps.newReadOnlyAuthManager(services, cfg.authDir, cfg.openapiEndpoint, cfg.inferEndpoint, cfg.webEndpoint, always)
+	} else {
+		auth, initErr = deps.newAuthManager(services, cfg.authDir, cfg.openapiEndpoint, cfg.inferEndpoint, cfg.webEndpoint, always)
+	}
 	if initErr != nil {
 		return fmt.Errorf("init auth: %w", initErr)
 	}
+	auth.readOnly = cfg.readOnlyAuth
 
 	if cfg.login {
 		if loginErr := deps.deviceLogin(ctx, auth, stdout); loginErr != nil {
